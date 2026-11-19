@@ -79,7 +79,7 @@ jobs:
           WORK_DIR="${{ runner.temp }}/quest2-build"
           mkdir -p "$WORK_DIR"
           
-          if [[ "${{ inputs.kernel_source }}" == "oculus" ]]; then
+          if [[ "${{ inputs.kernel_source }}" == "oculus" || -z "${{ inputs.kernel_source }}" ]]; then
             KERNEL_SRC="$WORK_DIR/oculus-kernel"
             if [[ ! -d "$KERNEL_SRC/.git" ]]; then
               git clone https://github.com/facebookincubator/oculus-linux-kernel.git "$KERNEL_SRC"
