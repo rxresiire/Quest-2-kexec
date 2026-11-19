@@ -170,6 +170,7 @@ jobs:
           flags=(
             ARCH=arm64 CC=clang LD=ld.lld HOSTCC=clang HOSTCXX=clang++ \
             CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-
+            LOCALVERSION=-g429559e91fe8
             KBUILD_BUILD_USER=questbuilder KBUILD_BUILD_HOST=quest2-ci
             KBUILD_BUILD_TIMESTAMP="2026-11-19T00:00:00Z"
           )
@@ -230,7 +231,7 @@ jobs:
 
           make -C "$KERNEL_OUT" -j"$(nproc)" \
             ARCH=arm64 CC=clang LD=ld.lld HOSTCC=clang CROSS_COMPILE=aarch64-linux-gnu- \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- LOCALVERSION=-g429559e91fe8 \
             KBUILD_BUILD_USER=questbuilder KBUILD_BUILD_HOST=quest2-ci \
             KBUILD_BUILD_TIMESTAMP="2026-11-19T00:00:00Z" \
             M="${{ github.workspace }}/witherblitz/module" $QKX_FLAG modules \
@@ -363,11 +364,13 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK packages
-        run: sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+      - name: Install Android SDK packages
+        run: |
+          SDKMANAGER=$(find "$ANDROID_SDK_ROOT" -path '*/bin/sdkmanager' -type f | sort | tail -1)
+          echo "Using $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
 
       - name: Assemble debug APK
         working-directory: app
