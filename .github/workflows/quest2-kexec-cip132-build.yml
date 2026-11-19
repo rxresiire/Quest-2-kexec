@@ -270,34 +270,69 @@ PYEOF
           CLANG_DIR="${{ steps.clang.outputs.CLANG_DIR }}"
           MODULE_DIR="${{ runner.temp }}/modules"
           
-          cat > "${{ runner.temp }}/build-provenance.json" << EOF
-{
-  "source_repo": "WitherBlitz/Quest-2-Steam-OS-Dual-Boot (with Hollywood modifications)",
-  "source_commit": "$(cd "${{ github.workspace }}/witherblitz" && git rev-parse HEAD)",
-  "kernel_repo": "${{ inputs.kernel_source == 'oculus' && 'facebookincubator/oculus-linux-kernel' || 'git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip-4.19.y.git' }}",
-  "kernel_commit": "$(cd "$KERNEL_SRC" && git rev-parse HEAD)",
-  "kernel_branch": "${{ inputs.kernel_source == 'oculus' && 'oculus-quest2-kernel-master' || '4.19-cip132' }}",
-  "target_build": "${{ inputs.target_build }}",
-  "compiler": "clang-r450784e",
-  "compiler_commit": "425c8149f17c8d9914bf690b4d5abe45a13fb993",
-  "clang_sha256": "$(sha256sum "$CLANG_DIR/bin/clang" | cut -d' ' -f1)",
-  "lld_sha256": "$(sha256sum "$CLANG_DIR/bin/ld.lld" | cut -d' ' -f1)",
-  "config_sha256": "$(sha256sum "$KERNEL_OUT/.config" | cut -d' ' -f1)",
-  "kernel_image_sha256": "$(sha256sum "$KERNEL_OUT/arch/arm64/boot/Image" | cut -d' ' -f1)",
-  "module_symvers_sha256": "$(sha256sum "$KERNEL_OUT/Module.symvers" | cut -d' ' -f1)",
-  "kernel_version": "$(cat "$KERNEL_OUT/include/config/kernel.release")",
-  "quest_kexec_sha256": "$(sha256sum "$MODULE_DIR/quest_kexec.ko" | cut -d' ' -f1)",
-  "hardware_handoff": "unproven",
-  "deployment_performed": false,
-  "build_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "modifications": [
-    "loader.c: DMA gate removed for Hollywood",
-    "loader.c: qkx_execute() integrates shutdown framework",
-    "shutdown_backends.c: NEW - 10 Quest 2 Hollywood backends",
-    "Makefile: +shutdown_backends.o"
-  ]
+          cat > "${{ runner.temp }}/generate_provenance.py" << 'PYEOF'
+import json
+import os
+import subprocess
+import hashlib
+
+def sha256sum(filepath):
+    if not os.path.exists(filepath):
+        return "MISSING"
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def get_git_rev(path):
+    try:
+        result = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=path, capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+    except:
+        return "UNKNOWN"
+
+kernel_src = os.environ['KERNEL_SRC']
+kernel_out = os.environ['KERNEL_OUT']
+clang_dir = os.environ['CLANG_DIR']
+module_dir = os.environ['MODULE_DIR']
+github_workspace = os.environ['GITHUB_WORKSPACE']
+target_build = os.environ['TARGET_BUILD']
+kernel_source = os.environ['KERNEL_SOURCE']
+
+provenance = {
+    "source_repo": "WitherBlitz/Quest-2-Steam-OS-Dual-Boot (with Hollywood modifications)",
+    "source_commit": get_git_rev(os.path.join(github_workspace, "witherblitz")),
+    "kernel_repo": "facebookincubator/oculus-linux-kernel" if kernel_source == "oculus" else "git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip-4.19.y.git",
+    "kernel_commit": get_git_rev(kernel_src),
+    "kernel_branch": "oculus-quest2-kernel-master" if kernel_source == "oculus" else "4.19-cip132",
+    "target_build": target_build,
+    "compiler": "clang-r450784e",
+    "compiler_commit": "425c8149f17c8d9914bf690b4d5abe45a13fb993",
+    "clang_sha256": sha256sum(os.path.join(clang_dir, "bin", "clang")),
+    "lld_sha256": sha256sum(os.path.join(clang_dir, "bin", "ld.lld")),
+    "config_sha256": sha256sum(os.path.join(kernel_out, ".config")),
+    "kernel_image_sha256": sha256sum(os.path.join(kernel_out, "arch", "arm64", "boot", "Image")),
+    "module_symvers_sha256": sha256sum(os.path.join(kernel_out, "Module.symvers")),
+    "kernel_version": open(os.path.join(kernel_out, "include", "config", "kernel.release")).read().strip() if os.path.exists(os.path.join(kernel_out, "include", "config", "kernel.release")) else "UNKNOWN",
+    "quest_kexec_sha256": sha256sum(os.path.join(module_dir, "quest_kexec.ko")),
+    "hardware_handoff": "unproven",
+    "deployment_performed": False,
+    "build_timestamp": subprocess.run(['date', '-u', '+%Y-%m-%dT%H:%M:%SZ'], capture_output=True, text=True).stdout.strip(),
+    "modifications": [
+        "loader.c: DMA gate removed for Hollywood",
+        "loader.c: qkx_execute() integrates shutdown framework",
+        "shutdown_backends.c: NEW - 10 Quest 2 Hollywood backends",
+        "Makefile: +shutdown_backends.o"
+    ]
 }
-EOF
+
+with open(os.path.join(os.environ['RUNNER_TEMP'], "build-provenance.json"), 'w') as f:
+    json.dump(provenance, f, indent=2)
+
+print("Build provenance generated")
+PYEOF
+          KERNEL_SRC="$KERNEL_SRC" KERNEL_OUT="$KERNEL_OUT" CLANG_DIR="$CLANG_DIR" MODULE_DIR="$MODULE_DIR" GITHUB_WORKSPACE="${{ github.workspace }}" TARGET_BUILD="${{ inputs.target_build }}" KERNEL_SOURCE="${{ inputs.kernel_source }}" RUNNER_TEMP="${{ runner.temp }}" python3 "${{ runner.temp }}/generate_provenance.py"
           cat "${{ runner.temp }}/build-provenance.json"
 
       - name: Create artifacts package
