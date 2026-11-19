@@ -18,10 +18,15 @@ VERMAGIC = "4.19.325-cip132-st16-g429559e91fe8 SMP preempt mod_unload modversion
 def decode_config(encoded, expected_sha=CONFIG_SHA):
     if not encoded or not encoded.strip():
         raise ValueError("Private config secret is empty or missing")
+    print(f"DEBUG: Secret length={len(encoded)}, first20={encoded[:20]}, last20={encoded[-20:]}")
     encoded = encoded.strip()
+    # Remove any whitespace/newlines that might have been introduced
+    encoded = ''.join(encoded.split())
+    print(f"DEBUG: After strip length={len(encoded)}, first20={encoded[:20]}, last20={encoded[-20:]}")
     try:
         packed = base64.b64decode(encoded, validate=True)
     except Exception as exc:
+        print(f"DEBUG: Base64 decode failed: {exc}")
         raise ValueError(f"Private config is not valid Base64: {exc}") from exc
     if not packed:
         raise ValueError("Base64 decoded to empty bytes")
