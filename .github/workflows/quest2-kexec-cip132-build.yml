@@ -95,7 +95,7 @@ jobs:
                 https://github.com/facebookincubator/oculus-linux-kernel.git "$KERNEL_SRC"
             fi
             cd "$KERNEL_SRC"
-            DEFCONFIG=vendor/oculus_hollywood_defconfig
+            DEFCONFIG=vendor/oculus_kona_defconfig
           else
             KERNEL_SRC="$WORK_DIR/cip-kernel"
             if [[ ! -d "$KERNEL_SRC/.git" ]]; then
@@ -109,11 +109,12 @@ jobs:
             for patch in "${{ github.workspace }}/witherblitz/kernel/patches/quest2-startup"/*.patch; do
               [[ -f "$patch" ]] && git apply "$patch" || echo "Patch $patch skipped"
             done
-            DEFCONFIG=vendor/oculus_hollywood_defconfig
+            DEFCONFIG=vendor/oculus_kona_defconfig
           fi
 
           echo "KERNEL_SRC=$KERNEL_SRC" >> "$GITHUB_OUTPUT"
           echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_OUTPUT"
+          echo "FRAGMENT=vendor/oculus_hollywood_defconfig" >> "$GITHUB_OUTPUT"
           echo "Kernel source: $KERNEL_SRC"
           echo "Defconfig: $DEFCONFIG"
 
@@ -124,6 +125,7 @@ jobs:
         run: |
           KERNEL_SRC="${{ steps.kernel.outputs.KERNEL_SRC }}"
           DEFCONFIG="${{ steps.kernel.outputs.DEFCONFIG }}"
+          FRAGMENT="${{ steps.kernel.outputs.FRAGMENT }}"
           CLANG_BIN="${{ steps.clang.outputs.CLANG_BIN }}"
           mkdir -p "$KERNEL_OUT" "${{ github.workspace }}/config"
           export PATH="$CLANG_BIN:$PATH"
@@ -141,9 +143,12 @@ jobs:
             SOURCE=device-secret
             echo "Kernel config came from the device secret and matched the pinned digest."
           elif [[ $STATUS -eq 3 ]]; then
-            echo "::warning::Q2_CONFIG_GZ_B64 is unusable, deriving the config from $DEFCONFIG instead."
+            echo "::warning::Q2_CONFIG_GZ_B64 is unusable, deriving the config from $DEFCONFIG + $FRAGMENT."
             cd "$KERNEL_SRC"
             make O="$KERNEL_OUT" ARCH=arm64 "$DEFCONFIG"
+            cat "$KERNEL_SRC/$FRAGMENT" >> "$KERNEL_OUT/.config"
+            "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --disable LOCALVERSION_AUTO
+            make O="$KERNEL_OUT" ARCH=arm64 olddefconfig
             cp "$KERNEL_OUT/.config" "$PREPARED"
             cd "${{ github.workspace }}/clean_repo"
             python3 quest2_audit_cip132.py config "$PREPARED" --from-file "$PREPARED"
