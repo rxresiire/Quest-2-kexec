@@ -157,7 +157,7 @@ jobs:
           
           cd "$KERNEL_SRC"
           make O="$KERNEL_OUT" "${flags[@]}" olddefconfig
-make O="$KERNEL_OUT" -j"$(nproc)" "${flags[@]}" Image modules 2>&1 | tee kernel-build.log
+          make O="$KERNEL_OUT" -j"$(nproc)" "${flags[@]}" Image modules 2>&1 | tee kernel-build.log
           
           BUILT_VER=$(cat "$KERNEL_OUT/include/config/kernel.release")
           echo "Built kernel version: $BUILT_VER"
