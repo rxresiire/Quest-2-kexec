@@ -163,28 +163,30 @@ jobs:
           echo "Built kernel version: $BUILT_VER"
           echo "BUILT_VER=$BUILT_VER" >> $GITHUB_OUTPUT
           
-          cp "$KERNEL_OUT/Module.symvers" "${{ runner.temp }}/Module.symvers"
-          
-          # Generate stock CRCs JSON from kernel's Module.symvers for cip132-st16 audit
-          python3 -c "
+cp "$KERNEL_OUT/Module.symvers" "${{ runner.temp }}/Module.symvers"
+           
+           # Generate stock CRCs JSON from kernel's Module.symvers for cip132-st16 audit
+           cat > "${{ runner.temp }}/generate_crcs.py" << 'PYEOF'
 import json
+import os
 symbols = {}
-with open('${{ runner.temp }}/Module.symvers') as f:
+with open(os.environ.get('MODULE_SYMVERS', '${{ runner.temp }}/Module.symvers')) as f:
     for line in f:
         parts = line.split()
         if len(parts) >= 3:
             symbols[parts[1]] = '0x' + parts[0]
-with open('${{ runner.temp }}/stock_crcs_cip132.json', 'w') as f:
+with open(os.environ.get('OUTPUT_JSON', '${{ runner.temp }}/stock_crcs_cip132.json'), 'w') as f:
     json.dump({
         'schema_version': 1,
-        'kernel': '$BUILT_VER',
-        'firmware': '${{ inputs.target_build }}',
+        'kernel': os.environ.get('BUILT_VER', ''),
+        'firmware': os.environ.get('TARGET_BUILD', ''),
         'stock_image_sha256': 'GENERATED_FROM_KERNEL_BUILD',
         'provenance': 'Generated from kernel build Module.symvers for cip132-st16 audit',
         'symbols': symbols
     }, f, indent=2)
-  "
-          echo "Generated stock CRCs from kernel Module.symvers"
+PYEOF
+           MODULE_SYMVERS="${{ runner.temp }}/Module.symvers" OUTPUT_JSON="${{ runner.temp }}/stock_crcs_cip132.json" BUILT_VER="$BUILT_VER" TARGET_BUILD="${{ inputs.target_build }}" python3 "${{ runner.temp }}/generate_crcs.py"
+           echo "Generated stock CRCs from kernel Module.symvers"
 
       - name: Build quest_kexec module
         run: |
