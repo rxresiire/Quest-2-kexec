@@ -16,16 +16,31 @@ VERMAGIC = "4.19.325-cip132-st16-g429559e91fe8 SMP preempt mod_unload modversion
 
 
 def decode_config(encoded, expected_sha=CONFIG_SHA):
+    if not encoded or not encoded.strip():
+        raise ValueError("Private config secret is empty or missing")
+    encoded = encoded.strip()
     try:
         packed = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ValueError(f"Private config is not valid Base64: {exc}") from exc
+    if not packed:
+        raise ValueError("Base64 decoded to empty bytes")
+    if len(packed) < 20:
+        raise ValueError(f"Base64 decoded payload too small ({len(packed)} bytes) - likely truncated")
+    try:
         with gzip.GzipFile(fileobj=io.BytesIO(packed)) as stream:
             config = stream.read(1024*1024+1)
-    except (ValueError, OSError, EOFError) as exc:
-        raise ValueError("Private config encoding is invalid") from exc
-    if not config or len(config) > 1024*1024:
-        raise ValueError("Private config size is invalid")
-    if hashlib.sha256(config).hexdigest() != expected_sha:
-        raise ValueError("Private config digest does not match the approved input")
+    except OSError as exc:
+        raise ValueError(f"Gzip decompression failed: {exc}") from exc
+    except EOFError as exc:
+        raise ValueError(f"Gzip stream truncated or corrupt: {exc}") from exc
+    if not config:
+        raise ValueError("Gzip decompressed to empty config")
+    if len(config) > 1024*1024:
+        raise ValueError(f"Decompressed config too large ({len(config)} bytes, max 1MiB)")
+    actual_sha = hashlib.sha256(config).hexdigest()
+    if actual_sha != expected_sha:
+        raise ValueError(f"Private config digest mismatch: got {actual_sha}, expected {expected_sha}")
     return config
 
 
