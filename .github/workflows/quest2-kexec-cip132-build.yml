@@ -368,4 +368,5 @@ PYEOF
             ${{ runner.temp }}/quest2-build/**/*.log
             ${{ runner.temp }}/kernel-build.log
             ${{ runner.temp }}/loader-build.log
-          retention-days: 14
+          retention-days: 14#   F o r c e   r e - r e g i s t r a t i o n   1 1 / 1 9 / 2 0 2 6   0 4 : 1 7 : 2 8  
+ 
