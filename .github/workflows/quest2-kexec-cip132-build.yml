@@ -90,8 +90,9 @@ jobs:
             
             COMMIT=$(git log --oneline --all --grep="$TARGET_BUILD" | head -1 | awk '{print $1}')
             if [[ -z "$COMMIT" ]]; then
-              COMMIT=$(git rev-parse oculus-quest2-kernel-master)
-              echo "Using oculus-quest2-kernel-master: $COMMIT"
+              DEFAULT_BRANCH=$(git remote show origin | awk '/HEAD branch/ {print $NF}')
+              COMMIT=$(git rev-parse "$DEFAULT_BRANCH")
+              echo "Using default branch ($DEFAULT_BRANCH): $COMMIT"
             else
               echo "Found matching commit: $COMMIT"
             fi
