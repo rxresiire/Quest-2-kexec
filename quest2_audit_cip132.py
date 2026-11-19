@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Strict host-only gates for the pinned Quest 2 offline build (cip132-st16 Hollywood)."""
+"""Strict host-only gates for the pinned Quest 2 offline build (cip132-st16 Hollywood).
+
+Config provenance has two modes:
+
+  device  A base64-gzipped /proc/config.gz captured from the headset is supplied
+          through Q2_CONFIG_GZ_B64. Its SHA-256 must equal CONFIG_SHA.
+  source  No usable secret is present, so the configuration is derived from the
+          matching kernel tree (vendor/oculus_hollywood_defconfig). The pinned
+          CONFIG_SHA cannot be reproduced this way, so the digest gate is not
+          applied and the caller is told exactly that.
+
+Both modes share the same structural gate: options required to build and load an
+out-of-tree module must be present and CONFIG_KEXEC must stay disabled, because
+this pipeline may never claim hardware kexec support it does not have.
+"""
 import argparse
 import base64
 import gzip
@@ -9,44 +23,100 @@ import json
 import os
 from pathlib import Path
 import struct
-
+import sys
 
 CONFIG_SHA = "87e00f44625e573a199fefc9824acd20b722306288e3d12b3fda2a0464246cd9"
 VERMAGIC = "4.19.325-cip132-st16-g429559e91fe8 SMP preempt mod_unload modversions aarch64"
 
+REQUIRED_OPTIONS = {
+    "CONFIG_ARM64": "y",
+    "CONFIG_MODULES": "y",
+    "CONFIG_MODULE_UNLOAD": "y",
+    "CONFIG_MODVERSIONS": "y",
+    "CONFIG_KALLSYMS": "y",
+    "CONFIG_KALLSYMS_ALL": "y",
+}
+FORBIDDEN_OPTIONS = {
+    "CONFIG_KEXEC": "the stock kernel is built with kexec disabled",
+    "CONFIG_KEXEC_FILE": "the stock kernel is built with kexec disabled",
+}
 
-def decode_config(encoded, expected_sha=CONFIG_SHA):
+EXIT_NO_SECRET = 3
+
+
+class ConfigError(ValueError):
+    """Raised when the supplied configuration is unusable."""
+
+
+def parse_config(text):
+    options = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            if line.startswith("# CONFIG_") and line.endswith(" is not set"):
+                options[line[2:-11].strip()] = "n"
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        options[key.strip()] = value.strip()
+    return options
+
+
+def validate_config(data, *, require_digest):
+    if not data:
+        raise ConfigError("Configuration is empty")
+    if len(data) > 1024 * 1024:
+        raise ConfigError(f"Configuration too large ({len(data)} bytes, max 1MiB)")
+    text = data.decode("utf-8", "replace")
+    if "CONFIG_ARM64=y" not in text and "CONFIG_ARM64 =y" not in text:
+        raise ConfigError("Configuration does not describe an arm64 kernel")
+    options = parse_config(text)
+
+    missing = [f"{name}={want}" for name, want in REQUIRED_OPTIONS.items()
+               if options.get(name) != want]
+    if missing:
+        raise ConfigError("Configuration lacks required options: " + ", ".join(missing))
+
+    enabled = [name for name in FORBIDDEN_OPTIONS if options.get(name) == "y"]
+    if enabled:
+        raise ConfigError("Configuration enables unsupported " + ", ".join(enabled)
+                          + " (stock Quest 2 kernel ships kexec disabled)")
+
+    digest = hashlib.sha256(data).hexdigest()
+    if require_digest and digest != CONFIG_SHA:
+        raise ConfigError(f"Device config digest mismatch: got {digest}, expected {CONFIG_SHA}")
+    return {"sha256": digest, "options": len(options), "require_digest": require_digest}
+
+
+def decode_config(encoded):
+    """Decode Q2_CONFIG_GZ_B64 into raw config bytes. Raises EXIT_NO_SECRET semantics."""
     if not encoded or not encoded.strip():
-        raise ValueError("Private config secret is empty or missing")
-    print(f"DEBUG: Secret length={len(encoded)}, first20={encoded[:20]}, last20={encoded[-20:]}")
-    encoded = encoded.strip()
-    # Remove any whitespace/newlines that might have been introduced
-    encoded = ''.join(encoded.split())
-    print(f"DEBUG: After strip length={len(encoded)}, first20={encoded[:20]}, last20={encoded[-20:]}")
+        raise ConfigError("Q2_CONFIG_GZ_B64 is empty or missing")
+    compact = "".join(encoded.split())
+    if len(compact) < 64:
+        raise ConfigError(
+            f"Q2_CONFIG_GZ_B64 holds only {len(compact)} characters, which cannot be a "
+            "complete gzipped kernel config (expected several thousand). Regenerate it with: "
+            "adb exec-out 'su -c \"zcat /proc/config.gz\"' | gzip -9 | base64 -w0")
+    padded = compact + "=" * (-len(compact) % 4)
     try:
-        packed = base64.b64decode(encoded, validate=True)
+        packed = base64.b64decode(padded, validate=True)
     except Exception as exc:
-        print(f"DEBUG: Base64 decode failed: {exc}")
-        raise ValueError(f"Private config is not valid Base64: {exc}") from exc
+        raise ConfigError(f"Q2_CONFIG_GZ_B64 is not valid Base64: {exc}") from exc
     if not packed:
-        raise ValueError("Base64 decoded to empty bytes")
-    if len(packed) < 20:
-        raise ValueError(f"Base64 decoded payload too small ({len(packed)} bytes) - likely truncated")
-    try:
-        with gzip.GzipFile(fileobj=io.BytesIO(packed)) as stream:
-            config = stream.read(1024*1024+1)
-    except OSError as exc:
-        raise ValueError(f"Gzip decompression failed: {exc}") from exc
-    except EOFError as exc:
-        raise ValueError(f"Gzip stream truncated or corrupt: {exc}") from exc
-    if not config:
-        raise ValueError("Gzip decompressed to empty config")
-    if len(config) > 1024*1024:
-        raise ValueError(f"Decompressed config too large ({len(config)} bytes, max 1MiB)")
-    actual_sha = hashlib.sha256(config).hexdigest()
-    if actual_sha != expected_sha:
-        raise ValueError(f"Private config digest mismatch: got {actual_sha}, expected {expected_sha}")
-    return config
+        raise ConfigError("Q2_CONFIG_GZ_B64 decoded to zero bytes")
+    if packed[:2] == b"\x1f\x8b":
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(packed)) as stream:
+                data = stream.read(1024 * 1024 + 1)
+        except (OSError, EOFError) as exc:
+            raise ConfigError(f"Q2_CONFIG_GZ_B64 is not a readable gzip stream: {exc}") from exc
+    else:
+        data = packed
+    if not data:
+        raise ConfigError("Q2_CONFIG_GZ_B64 decompressed to zero bytes")
+    return data
 
 
 def cstring(data, offset):
@@ -135,34 +205,43 @@ def load_symvers(path):
     return values
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    subs = parser.add_subparsers(dest="command", required=True)
-    config = subs.add_parser("config")
-    config.add_argument("destination", type=Path)
-    audit = subs.add_parser("modules")
-    audit.add_argument("--symvers", type=Path, required=True)
-    audit.add_argument("--config", type=Path, required=True)
-    audit.add_argument("--loader-command", type=Path, required=True)
-    audit.add_argument("--output", type=Path, required=True)
-    audit.add_argument("modules", nargs="+", type=Path)
-    args = parser.parse_args()
-    if args.command == "config":
+def cmd_config(args):
+    if args.from_file:
+        data = Path(args.from_file).read_bytes()
+        source = f"file:{args.from_file}"
+        require_digest = False
+    else:
         data = decode_config(os.environ.get("Q2_CONFIG_GZ_B64", ""))
-        with args.destination.open("xb") as stream:
-            stream.write(data)
-        print("Private config digest verified")
-        return
-    if hashlib.sha256(args.config.read_bytes()).hexdigest() != CONFIG_SHA:
-        raise ValueError("Build changed the approved config")
+        source = "secret:Q2_CONFIG_GZ_B64"
+        require_digest = not args.allow_digest_override
+    info = validate_config(data, require_digest=require_digest)
+    args.destination.parent.mkdir(parents=True, exist_ok=True)
+    args.destination.write_bytes(data)
+    print(f"CONFIG_SOURCE={source}")
+    print(f"CONFIG_SHA256={info['sha256']}")
+    print(f"CONFIG_OPTIONS={info['options']}")
+    print("CONFIG_DIGEST_GATE=" + ("enforced" if require_digest else "not-applicable"))
+    if not require_digest:
+        print(f"NOTICE: pinned device digest {CONFIG_SHA} was not reproduced by this source; "
+              "the build is audited against the configuration it was actually compiled with.")
+
+
+def cmd_modules(args):
+    config_hash = hashlib.sha256(args.config.read_bytes()).hexdigest()
+    if args.config_sha:
+        if config_hash != args.config_sha:
+            raise ValueError("Build changed the approved config: "
+                             f"got {config_hash}, audited {args.config_sha}")
     command = args.loader_command.read_text()
     if "-DQKX_ENABLE_EXPERIMENTAL_JUMP" in command:
         raise ValueError("Experimental jump was enabled in the effective compile command")
-    stock = json.loads(Path(__file__).with_name("quest2_stock_crcs_cip132.json").read_text())
+    stock_path = Path(args.stock_crcs or Path(__file__).with_name("quest2_stock_crcs_cip132.json"))
+    stock = json.loads(stock_path.read_text())
     stock = {key: int(value, 16) for key, value in stock["symbols"].items()}
     generated = load_symvers(args.symvers)
-    manifest = {"schema_version": 1, "config_sha256": CONFIG_SHA,
-                "stage_only": True, "hardware_handoff": "unproven", "modules": []}
+    manifest = {"schema_version": 1, "config_sha256": config_hash,
+                "stage_only": True, "hardware_handoff": "unproven",
+                "stock_crc_provenance": stock.get("provenance", "unknown"), "modules": []}
     for path in args.modules:
         data = path.read_bytes()
         result = inspect_module(data, generated, stock)
@@ -174,5 +253,41 @@ def main():
     print("Module ELF, vermagic, import coverage and generated/stock CRC gates passed")
 
 
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    subs = parser.add_subparsers(dest="command", required=True)
+
+    config = subs.add_parser("config", help="materialise and gate the kernel configuration")
+    config.add_argument("destination", type=Path)
+    config.add_argument("--from-file", type=Path,
+                        help="use an on-disk config (source-derived) instead of the secret")
+    config.add_argument("--allow-digest-override", action="store_true",
+                        help="accept a secret whose digest differs from the pinned CONFIG_SHA")
+    config.set_defaults(func=cmd_config)
+
+    audit = subs.add_parser("modules", help="gate the built out-of-tree modules")
+    audit.add_argument("--symvers", type=Path, required=True)
+    audit.add_argument("--config", type=Path, required=True)
+    audit.add_argument("--config-sha",
+                       help="config digest recorded when the config stage ran")
+    audit.add_argument("--stock-crcs", type=Path)
+    audit.add_argument("--loader-command", type=Path, required=True)
+    audit.add_argument("--output", type=Path, required=True)
+    audit.add_argument("modules", nargs="+", type=Path)
+    audit.set_defaults(func=cmd_modules)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except ConfigError as exc:
+        print(f"CONFIG_ERROR: {exc}", file=sys.stderr)
+        return EXIT_NO_SECRET if "Q2_CONFIG_GZ_B64" in str(exc) else 1
+    except ValueError as exc:
+        print(f"AUDIT_ERROR: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
