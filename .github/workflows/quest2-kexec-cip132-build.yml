@@ -270,7 +270,7 @@ PYEOF
           CLANG_DIR="${{ steps.clang.outputs.CLANG_DIR }}"
           MODULE_DIR="${{ runner.temp }}/modules"
           
-          cat > "${{ runner.temp }}/build-provenance.json" << 'EOF'
+          cat > "${{ runner.temp }}/build-provenance.json" << EOF
 {
   "source_repo": "WitherBlitz/Quest-2-Steam-OS-Dual-Boot (with Hollywood modifications)",
   "source_commit": "$(cd "${{ github.workspace }}/witherblitz" && git rev-parse HEAD)",
