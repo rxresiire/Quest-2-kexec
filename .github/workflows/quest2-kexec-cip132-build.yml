@@ -1,4 +1,4 @@
-name: Quest 2 kexec Build for cip132-st16 (Hollywood) - FORCE_REGISTRATION 2026-11-19 07:52:00
+name: Quest 2 kexec Build for cip132-st16 (Hollywood) - FORCE_REGISTRATION 2026-11-19 08:05:00
 
 on:
   workflow_dispatch:
@@ -270,34 +270,34 @@ PYEOF
           CLANG_DIR="${{ steps.clang.outputs.CLANG_DIR }}"
           MODULE_DIR="${{ runner.temp }}/modules"
           
-          cat > "${{ runner.temp }}/build-provenance.json" <<EOF
-          {
-            "source_repo": "WitherBlitz/Quest-2-Steam-OS-Dual-Boot (with Hollywood modifications)",
-            "source_commit": "$(cd "${{ github.workspace }}/witherblitz" && git rev-parse HEAD)",
-            "kernel_repo": "${{ inputs.kernel_source == 'oculus' && 'facebookincubator/oculus-linux-kernel' || 'git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip-4.19.y.git' }}",
-            "kernel_commit": "$(cd "$KERNEL_SRC" && git rev-parse HEAD)",
-            "kernel_branch": "${{ inputs.kernel_source == 'oculus' && 'oculus-quest2-kernel-master' || '4.19-cip132' }}",
-            "target_build": "${{ inputs.target_build }}",
-            "compiler": "clang-r450784e",
-            "compiler_commit": "425c8149f17c8d9914bf690b4d5abe45a13fb993",
-            "clang_sha256": "$(sha256sum "$CLANG_DIR/bin/clang" | cut -d' ' -f1)",
-            "lld_sha256": "$(sha256sum "$CLANG_DIR/bin/ld.lld" | cut -d' ' -f1)",
-            "config_sha256": "$(sha256sum "$KERNEL_OUT/.config" | cut -d' ' -f1)",
-            "kernel_image_sha256": "$(sha256sum "$KERNEL_OUT/arch/arm64/boot/Image" | cut -d' ' -f1)",
-            "module_symvers_sha256": "$(sha256sum "$KERNEL_OUT/Module.symvers" | cut -d' ' -f1)",
-            "kernel_version": "$(cat "$KERNEL_OUT/include/config/kernel.release")",
-            "quest_kexec_sha256": "$(sha256sum "$MODULE_DIR/quest_kexec.ko" | cut -d' ' -f1)",
-            "hardware_handoff": "unproven",
-            "deployment_performed": false,
-            "build_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "modifications": [
-              "loader.c: DMA gate removed for Hollywood",
-              "loader.c: qkx_execute() integrates shutdown framework",
-              "shutdown_backends.c: NEW - 10 Quest 2 Hollywood backends",
-              "Makefile: +shutdown_backends.o"
-            ]
-          }
-          EOF
+          cat > "${{ runner.temp }}/build-provenance.json" << 'EOF'
+{
+  "source_repo": "WitherBlitz/Quest-2-Steam-OS-Dual-Boot (with Hollywood modifications)",
+  "source_commit": "$(cd "${{ github.workspace }}/witherblitz" && git rev-parse HEAD)",
+  "kernel_repo": "${{ inputs.kernel_source == 'oculus' && 'facebookincubator/oculus-linux-kernel' || 'git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip-4.19.y.git' }}",
+  "kernel_commit": "$(cd "$KERNEL_SRC" && git rev-parse HEAD)",
+  "kernel_branch": "${{ inputs.kernel_source == 'oculus' && 'oculus-quest2-kernel-master' || '4.19-cip132' }}",
+  "target_build": "${{ inputs.target_build }}",
+  "compiler": "clang-r450784e",
+  "compiler_commit": "425c8149f17c8d9914bf690b4d5abe45a13fb993",
+  "clang_sha256": "$(sha256sum "$CLANG_DIR/bin/clang" | cut -d' ' -f1)",
+  "lld_sha256": "$(sha256sum "$CLANG_DIR/bin/ld.lld" | cut -d' ' -f1)",
+  "config_sha256": "$(sha256sum "$KERNEL_OUT/.config" | cut -d' ' -f1)",
+  "kernel_image_sha256": "$(sha256sum "$KERNEL_OUT/arch/arm64/boot/Image" | cut -d' ' -f1)",
+  "module_symvers_sha256": "$(sha256sum "$KERNEL_OUT/Module.symvers" | cut -d' ' -f1)",
+  "kernel_version": "$(cat "$KERNEL_OUT/include/config/kernel.release")",
+  "quest_kexec_sha256": "$(sha256sum "$MODULE_DIR/quest_kexec.ko" | cut -d' ' -f1)",
+  "hardware_handoff": "unproven",
+  "deployment_performed": false,
+  "build_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "modifications": [
+    "loader.c: DMA gate removed for Hollywood",
+    "loader.c: qkx_execute() integrates shutdown framework",
+    "shutdown_backends.c: NEW - 10 Quest 2 Hollywood backends",
+    "Makefile: +shutdown_backends.o"
+  ]
+}
+EOF
           cat "${{ runner.temp }}/build-provenance.json"
 
       - name: Create artifacts package
