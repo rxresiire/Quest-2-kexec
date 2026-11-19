@@ -114,7 +114,7 @@ jobs:
 
           echo "KERNEL_SRC=$KERNEL_SRC" >> "$GITHUB_OUTPUT"
           echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_OUTPUT"
-          echo "FRAGMENT=vendor/oculus_hollywood_defconfig" >> "$GITHUB_OUTPUT"
+          echo "FRAGMENT=arch/arm64/configs/vendor/oculus_hollywood_defconfig" >> "$GITHUB_OUTPUT"
           echo "Kernel source: $KERNEL_SRC"
           echo "Defconfig: $DEFCONFIG"
 
