@@ -1,4 +1,4 @@
-name: Quest 2 kexec Build for cip132-st16 (Hollywood)
+name: Quest 2 kexec Build for cip132-st16 (Hollywood) - FORCE_REGISTRATION 2026-11-19 03:37:44
 
 on:
   workflow_dispatch:
