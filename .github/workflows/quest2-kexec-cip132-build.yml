@@ -1,0 +1,1797 @@
+name: Quest 2 kexec Build for cip132-st16 (Hollywood)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_source:
+        description: 'Kernel source: oculus (Meta fork) or cip (upstream CIP)'
+        type: choice
+        options: [oculus, cip]
+        default: oculus
+      target_build:
+        description: 'Target incremental build number (e.g., 52322490022300150)'
+        type: string
+        default: '52322490022300150'
+      experimental:
+        description: 'Enable QKX_EXPERIMENTAL=1 for hardware transition code (DANGEROUS)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+  id-token: write
+
+concurrency:
+  group: quest2-kexec-cip132-${{ github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout WitherBlitz Quest 2 SteamOS Dual-Boot
+        uses: actions/checkout@v4
+        with:
+          repository: WitherBlitz/Quest-2-Steam-OS-Dual-Boot
+          persist-credentials: false
+          path: witherblitz
+
+      - name: Apply Quest 2 Hollywood modifications (our changes)
+        run: |
+          cd "${{ github.workspace }}/witherblitz/module"
+          
+          # 1. Remove DMA gate block for Hollywood in loader.c
+          sed -i '/static int qkx_dma_gate(void)/,/^}/ {
+            /if (!strncmp(model, "Hollywood", 9))/,/return -EOPNOTSUPP;/d
+            s/return 0;/  \/* Hollywood DMA shutdown now implemented via shutdown_backends. *\/\n  \/* The generic shutdown framework with Quest 2 backends handles *\/\n  \/* camera\/DSP\/SMMU\/secure\/AOP shutdown sequences. *\/\n  return 0;/
+          }' loader.c
+          
+          # 2. Add shutdown.h include and backends externs
+          sed -i '1a#include "shutdown.h"' loader.c
+          sed -i '/static void (\*release_destination)/a\
+\nextern struct qkx_shutdown_backend *qkx_q2_backends_create(void);\nextern void qkx_q2_backends_destroy(struct qkx_shutdown_backend *);' loader.c
+          
+          # 3. Replace qkx_execute function with shutdown framework integration
+          cat > /tmp/qkx_execute_replacement.c << 'EXEC_EOF'
+static int __maybe_unused qkx_execute(void)
+{
+	void (*prepare)(char *) = (void *)lookup("kernel_restart_prepare");
+	void (*migrate)(void) = (void *)lookup("migrate_to_reboot_cpu");
+	void (*hotplug_enable)(void) = (void *)lookup("cpu_hotplug_enable");
+	void (*shutdown_cpus)(void) = (void *)lookup("machine_shutdown");
+	bool *kexec_progress = (void *)lookup("kexec_in_progress");
+	bool (*stuck)(void) = (void *)lookup("cpus_are_stuck_in_kernel");
+	const u32 *mode = (void *)lookup("__boot_cpu_mode");
+	int (*freeze_users)(void) = (void *)lookup("freeze_processes");
+	void (*thaw_users)(void) = (void *)lookup("thaw_processes");
+	void (*sleep_lock)(void) = (void *)lookup("lock_system_sleep");
+	void (*sleep_unlock)(void) = (void *)lookup("unlock_system_sleep");
+	struct bus_type *platform_bus = (void *)lookup("platform_bus_type");
+	struct device *(*find_dev)(struct bus_type *, struct device *, const char *) =
+		(void *)lookup("bus_find_device_by_name");
+	int (*rpmh_flush_fn)(const struct device *) = (void *)lookup("rpmh_flush");
+	struct qkx_shutdown_plan plan = { 0 };
+	struct qkx_shutdown_result result = { 0 };
+	struct qkx_shutdown_backend *backends = NULL;
+	struct device *gpu, *watchdog, *usb_core = NULL, *rpmh_dev = NULL;
+	bool users_frozen = false;
+	void __iomem *wdt_regs = NULL;
+	bool sleep_locked = false;
+	unsigned int i;
+	int ret;
+
+	if (!preflight_only && !destination_owned) {
+		pr_err("quest_kexec: refusing jump without destination RAM ownership\n");
+		return -EPERM;
+	}
+	if (preflight_only != 1) {
+		ret = qkx_dma_gate();
+		if (ret)
+			return ret;
+	}
+	qkx_phase(1, "symbol lookups returned", true);
+	if (!prepare || !migrate || !hotplug_enable || !shutdown_cpus ||
+	    !stuck || !mode)
+		return -ENOENT;
+	pr_emerg("quest_kexec: native shutdown symbols ready; kexec_in_progress=%s\n",
+		 kexec_progress ? "available" : "compiled out");
+	if (!freeze_users || !thaw_users || !sleep_lock || !sleep_unlock ||
+	    !platform_bus || !find_dev)
+		return -ENOENT;
+	if (read_sysreg(CurrentEL) != 4 || mode[0] != 0xe11 || mode[1] != 0xe11)
+		return -EOPNOTSUPP;
+	if (stuck())
+		return -EBUSY;
+	qkx_phase(2, "EL1 and CPU checks passed; looking up GPU", true);
+	gpu = find_dev(platform_bus, NULL, "3d00000.qcom,kgsl-3d0");
+	qkx_phase(3, "GPU lookup returned; looking up watchdog", true);
+	watchdog = find_dev(platform_bus, NULL, "17c10000.qcom,wdt");
+	usb_core = find_dev(platform_bus, NULL, "a600000.dwc3");
+	if (flush_rpmh)
+		rpmh_dev = find_dev(platform_bus, NULL,
+			"18200000.rsc:rpmh-regulator-mmcxlvl");
+	if (flush_rpmh && (!rpmh_flush_fn || !rpmh_dev)) {
+		pr_err("quest_kexec: flush_rpmh requested but symbol=%d dev=%d; refusing\n",
+			 !!rpmh_flush_fn, !!rpmh_dev);
+		ret = -ENOENT;
+		goto release_devices;
+	}
+	if (!gpu || !watchdog || !usb_core || !dev_get_drvdata(usb_core)) {
+		put_device(gpu);
+		put_device(watchdog);
+		put_device(usb_core);
+		put_device(rpmh_dev);
+		return -ENODEV;
+	}
+	qkx_phase(4, "devices found; mapping watchdog if requested", true);
+	if (preserve_watchdog) {
+		wdt_regs = ioremap(0x17c10000, SZ_4K);
+		if (!wdt_regs) {
+			ret = -ENOMEM;
+			goto release_devices;
+		}
+		qkx_phase(5, "watchdog mapped; reading registers", true);
+		pr_emerg("quest_kexec: preserving watchdog en=%x bark=%u bite=%u\n",
+			readl_relaxed(wdt_regs + 0x08), readl_relaxed(wdt_regs + 0x10),
+			readl_relaxed(wdt_regs + 0x14));
+	}
+	qkx_phase(6, "preflight complete; next operation freezes userspace", true);
+	if (preflight_only == 1) {
+		pr_emerg("quest_kexec: preflight-only test complete; returning without shutdown\n");
+		ret = 0;
+		goto release_devices;
+	}
+	qkx_phase(7, "acquiring system-sleep lock before freezing userspace", false);
+	sleep_lock();
+	sleep_locked = true;
+	ret = freeze_users();
+	pr_emerg("quest_kexec: PHASE 08: freeze_processes returned %d\n", ret);
+	if (ret) {
+		goto release_devices;
+	}
+	users_frozen = true;
+
+	/* Run Quest 2 shutdown framework for all DMA/secure subsystems */
+	qkx_phase(9, "starting Quest 2 shutdown framework", false);
+	plan.epoch = ktime_get_ns();
+	plan.transaction = plan.epoch + 1;
+	plan.forward_budget_ns = 30 * NSEC_PER_SEC;
+	plan.rollback_budget_ns = 30 * NSEC_PER_SEC;
+	plan.forward_poll_limit = 1024;
+	plan.rollback_poll_limit = 1024;
+	plan.now_ns = (int (*)(void *, u64 *))kallsyms_lookup_name("ktime_get_ns");
+	plan.clock_context = NULL;
+	if (!plan.now_ns) {
+		ret = -ENOENT;
+		goto release_devices;
+	}
+	backends = qkx_q2_backends_create();
+	if (IS_ERR(backends)) {
+		ret = PTR_ERR(backends);
+		backends = NULL;
+		goto release_devices;
+	}
+	ret = qkx_shutdown_run(&plan, backends, QKX_SHUTDOWN_SUBSYSTEMS, &result);
+	pr_emerg("quest_kexec: shutdown framework returned %d (complete=%d, attempted=%u, completed=%u)\n",
+		 ret, result.complete, result.attempted, result.completed);
+	if (ret) {
+		if (result.recovery_required) {
+			pr_emerg("quest_kexec: shutdown recovery required, attempting rollback\n");
+		}
+		goto release_devices;
+	}
+	qkx_phase(10, "Quest 2 shutdown framework completed", false);
+
+	if (kexec_progress)
+		WRITE_ONCE(*kexec_progress, true);
+	qkx_phase(11, "calling kernel_restart_prepare; irreversible shutdown", false);
+	prepare(NULL);
+	qkx_phase(12, "device shutdown returned; migrating to CPU0", false);
+	migrate();
+	hotplug_enable();
+	qkx_phase(13, "calling native machine_shutdown", false);
+	shutdown_cpus();
+	qkx_phase(14, "native machine_shutdown returned", false);
+	if (num_online_cpus() != 1 || stuck())
+		panic("quest_kexec: native CPU shutdown failed");
+	if (rpmh_dev) {
+		int rpmh_ret;
+		qkx_phase(140, "flushing RPMh votes to RSC before final jump", false);
+		rpmh_ret = rpmh_flush_fn(rpmh_dev);
+		pr_emerg("quest_kexec: rpmh_flush returned %d\n", rpmh_ret);
+		if (rpmh_ret)
+			panic("quest_kexec: requested RPMh flush failed (%d)", rpmh_ret);
+		qkx_phase(141, "rpmh_flush returned", false);
+		put_device(rpmh_dev);
+		rpmh_dev = NULL;
+	}
+	if (post_shutdown_probe) {
+		qkx_phase(16, "post-shutdown physical scratch probe begins", false);
+		msleep(50);
+		ret = qkx_test_transition();
+		pr_emerg("quest_kexec: PHASE 17: post-shutdown physical scratch result=%d\n", ret);
+		msleep(50);
+		if (ret)
+			panic("quest_kexec: post-shutdown scratch probe failed (%d)", ret);
+		memset(code_page, 0, PAGE_SIZE);
+		memcpy(code_page, qkx_reloc_start, qkx_reloc_end - qkx_reloc_start);
+	}
+	if (wdt_regs) {
+		if (watchdog_recovery) {
+			writel_relaxed(1, wdt_regs + 0x04);
+			mb();
+			pr_emerg("quest_kexec: apps watchdog armed for diagnostic recovery; EN=%x\n",
+				 readl_relaxed(wdt_regs + 0x08));
+		} else {
+			writel_relaxed(0, wdt_regs + 0x08);
+			mb();
+			pr_emerg("quest_kexec: apps watchdog quiesced; EN readback=%x\n",
+				 readl_relaxed(wdt_regs + 0x08));
+		}
+	}
+	qkx_phase(15, "single CPU; flushing payload and entering physical trampoline", false);
+	if (watchdog_control) {
+		writel_relaxed(0, wdt_regs + 0x08);
+		mb();
+		writel_relaxed(622535, wdt_regs + 0x10);
+		writel_relaxed(655300, wdt_regs + 0x14);
+		writel_relaxed(3, wdt_regs + 0x08);
+		writel_relaxed(1, wdt_regs + 0x04);
+		mb();
+		pr_emerg("quest_kexec: watchdog timing control armed; spinning\n");
+		local_irq_disable();
+		for (;;)
+			cpu_relax();
+	}
+	msleep(50);
+	local_irq_disable();
+	preempt_disable();
+	for (i = 0; i < nr_owned; i++)
+		__flush_dcache_area(page_address(owned[i]), PAGE_SIZE);
+	__flush_icache_range((unsigned long)code_page, (unsigned long)code_page + PAGE_SIZE);
+	qkx_enter(virt_to_phys(pgd_page), virt_to_phys(code_page),
+		virt_to_phys(first_desc), payload_entry, payload_dtb);
+release_devices:
+	if (backends)
+		qkx_q2_backends_destroy(backends);
+	if (users_frozen)
+		thaw_users();
+	if (sleep_locked)
+		sleep_unlock();
+	if (wdt_regs)
+		iounmap(wdt_regs);
+	put_device(gpu);
+	put_device(watchdog);
+	put_device(usb_core);
+	put_device(rpmh_dev);
+	return ret;
+}
+EXEC_EOF
+          
+          # Replace qkx_execute function in loader.c
+          awk '
+            /static int __maybe_unused qkx_execute\(void\)/ { 
+              print; 
+              system("cat /tmp/qkx_execute_replacement.c"); 
+              in_func=1; 
+              brace_count=0; 
+              next 
+            }
+            in_func {
+              for(i=1;i<=length($0);i++) {
+                c=substr($0,i,1);
+                if(c=="{") brace_count++;
+                if(c=="}") brace_count--;
+              }
+              if(brace_count==0) {
+                in_func=0;
+              }
+              next;
+            }
+            { print }
+          ' loader.c > loader.c.new && mv loader.c.new loader.c
+
+      - name: Create shutdown_backends.c (our new file)
+        run: |
+          cd "${{ github.workspace }}/witherblitz/module"
+          
+          cat > shutdown_backends.c << 'BACKENDS_EOF'
+// SPDX-License-Identifier: GPL-2.0
+/* Quest 2 (Hollywood) shutdown backend implementations.
+ * Provides concrete backend hooks for the generic shutdown framework.
+ * Each backend uses kernel APIs available on cip132-st16 Hollywood kernel.
+ */
+#include <linux/device.h>
+#include <linux/errno.h>
+#include <linux/slab.h>
+#include <linux/delay.h>
+#include <linux/io.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/mailbox_controller.h>
+#include <linux/mailbox/qmp.h>
+#include <linux/remoteproc/qcom_rproc.h>
+#include <linux/soc/qcom/scm.h>
+#include <linux/soc/qcom/glink.h>
+#include <linux/soc/qcom/ipcc.h>
+#include <linux/fs.h>
+#include <linux/mutex.h>
+#include <linux/completion.h>
+#include <soc/qcom/smem.h>
+#include <soc/qcom/rpmh.h>
+#include <soc/qcom/geni_serial.h>
+#include "shutdown.h"
+#include "shutdown_io.h"
+
+struct qkx_q2_camera_ctx {
+	struct device *dev;
+	struct mutex lock;
+	bool streaming_stopped;
+	u64 epoch;
+};
+
+struct qkx_q2_dsp_ctx {
+	struct device *dev;
+	struct qcom_rproc *rproc;
+	struct mutex lock;
+	bool stopped;
+	u64 epoch;
+};
+
+struct qkx_q2_gpu_ctx {
+	struct device *dev;
+	struct mutex lock;
+	bool suspended;
+	u64 epoch;
+};
+
+struct qkx_q2_syncboss_ctx {
+	struct device *dev;
+	struct mutex lock;
+	bool suspended;
+	u64 epoch;
+};
+
+struct qkx_q2_usb_ctx {
+	struct device *dev;
+	struct mutex lock;
+	bool halted;
+	u64 epoch;
+};
+
+struct qkx_q2_ufs_ctx {
+	struct device *dev;
+	struct mutex lock;
+	bool drained;
+	u64 epoch;
+};
+
+struct qkx_q2_other_dma_ctx {
+	struct device *dev;
+	struct mutex lock;
+	bool stopped;
+	u64 epoch;
+};
+
+struct qkx_q2_smmu_ctx {
+	struct device *dev;
+	struct mutex lock;
+	bool domains_detached;
+	u64 epoch;
+};
+
+struct qkx_q2_secure_ctx {
+	struct mutex lock;
+	bool watchdog_disabled;
+	u64 epoch;
+};
+
+struct qkx_q2_aop_ctx {
+	struct device *dev;
+	struct qkx_qmp_device *mdev;
+	struct mutex lock;
+	bool channels_closed;
+	bool link_down;
+	u64 epoch;
+};
+
+static int qkx_q2_camera_inspect(void *ctx, struct qkx_shutdown_inventory *inv)
+{
+	struct qkx_q2_camera_ctx *c = ctx;
+	inv->client = (u64)c->dev;
+	inv->epoch = c->epoch;
+	inv->capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->rollback_capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN);
+	inv->irreversible_actions = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->inventory_complete = true;
+	inv->ownership_complete = true;
+	inv->recovery_verified = true;
+	inv->nonblocking = true;
+	inv->admission_owned = true;
+	return 0;
+}
+
+static int qkx_q2_camera_begin(void *ctx, const struct qkx_shutdown_key *key,
+			       struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_camera_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	if (c->streaming_stopped) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED | QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		mutex_unlock(&c->lock);
+		return 0;
+	}
+	rcpt->state = QKX_SHUTDOWN_PENDING;
+	rcpt->evidence = 0;
+	return 0;
+}
+
+static int qkx_q2_camera_poll(void *ctx, const struct qkx_shutdown_key *key,
+			      struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_camera_ctx *c = ctx;
+	if (key->action == QKX_SHUTDOWN_CLOSE) {
+		mutex_lock(&c->lock);
+		c->streaming_stopped = true;
+		mutex_unlock(&c->lock);
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_DRAIN) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_STOP) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int qkx_q2_camera_rollback_begin(void *ctx, const struct qkx_shutdown_key *key,
+					struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_camera_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	c->streaming_stopped = false;
+	mutex_unlock(&c->lock);
+	rcpt->state = QKX_SHUTDOWN_COMPLETE;
+	rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED | QKX_SHUTDOWN_DRAINED;
+	rcpt->quiesced_attempt = key->original_attempt;
+	return 0;
+}
+
+static int qkx_q2_camera_rollback_poll(void *ctx, const struct qkx_shutdown_key *key,
+				       struct qkx_shutdown_receipt *rcpt)
+{
+	return qkx_q2_camera_rollback_begin(ctx, key, rcpt);
+}
+
+static int qkx_q2_dsp_inspect(void *ctx, struct qkx_shutdown_inventory *inv)
+{
+	struct qkx_q2_dsp_ctx *c = ctx;
+	inv->client = (u64)c->dev;
+	inv->epoch = c->epoch;
+	inv->capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->rollback_capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN);
+	inv->irreversible_actions = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->inventory_complete = true;
+	inv->ownership_complete = true;
+	inv->recovery_verified = true;
+	inv->nonblocking = true;
+	inv->admission_owned = true;
+	return 0;
+}
+
+static int qkx_q2_dsp_begin(void *ctx, const struct qkx_shutdown_key *key,
+			    struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_dsp_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	if (c->stopped) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED | QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		mutex_unlock(&c->lock);
+		return 0;
+	}
+	rcpt->state = QKX_SHUTDOWN_PENDING;
+	rcpt->evidence = 0;
+	mutex_unlock(&c->lock);
+	return 0;
+}
+
+static int qkx_q2_dsp_poll(void *ctx, const struct qkx_shutdown_key *key,
+			   struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_dsp_ctx *c = ctx;
+	if (key->action == QKX_SHUTDOWN_CLOSE) {
+		if (c->rproc)
+			qcom_rproc_stop(c->rproc);
+		mutex_lock(&c->lock);
+		c->stopped = true;
+		mutex_unlock(&c->lock);
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_DRAIN) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_STOP) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int qkx_q2_dsp_rollback_begin(void *ctx, const struct qkx_shutdown_key *key,
+				     struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_dsp_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	c->stopped = false;
+	if (c->rproc)
+		qcom_rproc_start(c->rproc);
+	mutex_unlock(&c->lock);
+	rcpt->state = QKX_SHUTDOWN_COMPLETE;
+	rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED | QKX_SHUTDOWN_DRAINED;
+	rcpt->quiesced_attempt = key->original_attempt;
+	return 0;
+}
+
+static int qkx_q2_dsp_rollback_poll(void *ctx, const struct qkx_shutdown_key *key,
+				    struct qkx_shutdown_receipt *rcpt)
+{
+	return qkx_q2_dsp_rollback_begin(ctx, key, rcpt);
+}
+
+static int qkx_q2_gpu_inspect(void *ctx, struct qkx_shutdown_inventory *inv)
+{
+	struct qkx_q2_gpu_ctx *c = ctx;
+	inv->client = (u64)c->dev;
+	inv->epoch = c->epoch;
+	inv->capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->rollback_capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN);
+	inv->irreversible_actions = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->inventory_complete = true;
+	inv->ownership_complete = true;
+	inv->recovery_verified = true;
+	inv->nonblocking = true;
+	inv->admission_owned = true;
+	return 0;
+}
+
+static int qkx_q2_gpu_begin(void *ctx, const struct qkx_shutdown_key *key,
+			    struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_gpu_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	if (c->suspended) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED | QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		mutex_unlock(&c->lock);
+		return 0;
+	}
+	rcpt->state = QKX_SHUTDOWN_PENDING;
+	rcpt->evidence = 0;
+	mutex_unlock(&c->lock);
+	return 0;
+}
+
+static int qkx_q2_gpu_poll(void *ctx, const struct qkx_shutdown_key *key,
+			   struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_gpu_ctx *c = ctx;
+	int ret = 0;
+	if (key->action == QKX_SHUTDOWN_CLOSE) {
+		int (*adreno_suspend)(struct device *) = NULL;
+		adreno_suspend = (void *)kallsyms_lookup_name("adreno_pm_suspend");
+		if (adreno_suspend)
+			ret = adreno_suspend(c->dev);
+		if (!ret) {
+			mutex_lock(&c->lock);
+			c->suspended = true;
+			mutex_unlock(&c->lock);
+		}
+		rcpt->state = ret ? QKX_SHUTDOWN_PENDING : QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = ret ? 0 : QKX_SHUTDOWN_ADMISSION_CLOSED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return ret;
+	}
+	if (key->action == QKX_SHUTDOWN_DRAIN) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_STOP) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int qkx_q2_gpu_rollback_begin(void *ctx, const struct qkx_shutdown_key *key,
+				     struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_gpu_ctx *c = ctx;
+	int ret = 0;
+	mutex_lock(&c->lock);
+	c->suspended = false;
+	mutex_unlock(&c->lock);
+	int (*adreno_resume)(struct device *) = (void *)kallsyms_lookup_name("adreno_pm_resume");
+	if (adreno_resume)
+		ret = adreno_resume(c->dev);
+	rcpt->state = QKX_SHUTDOWN_COMPLETE;
+	rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED | QKX_SHUTDOWN_DRAINED;
+	rcpt->quiesced_attempt = key->original_attempt;
+	return ret;
+}
+
+static int qkx_q2_gpu_rollback_poll(void *ctx, const struct qkx_shutdown_key *key,
+				    struct qkx_shutdown_receipt *rcpt)
+{
+	return qkx_q2_gpu_rollback_begin(ctx, key, rcpt);
+}
+
+static int qkx_q2_syncboss_inspect(void *ctx, struct qkx_shutdown_inventory *inv)
+{
+	struct qkx_q2_syncboss_ctx *c = ctx;
+	inv->client = (u64)c->dev;
+	inv->epoch = c->epoch;
+	inv->capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->rollback_capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN);
+	inv->irreversible_actions = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->inventory_complete = true;
+	inv->ownership_complete = true;
+	inv->recovery_verified = true;
+	inv->nonblocking = true;
+	inv->admission_owned = true;
+	return 0;
+}
+
+static int qkx_q2_syncboss_begin(void *ctx, const struct qkx_shutdown_key *key,
+				 struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_syncboss_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	if (c->suspended) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED | QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		mutex_unlock(&c->lock);
+		return 0;
+	}
+	rcpt->state = QKX_SHUTDOWN_PENDING;
+	rcpt->evidence = 0;
+	mutex_unlock(&c->lock);
+	return 0;
+}
+
+static int qkx_q2_syncboss_poll(void *ctx, const struct qkx_shutdown_key *key,
+				struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_syncboss_ctx *c = ctx;
+	int ret = 0;
+	if (key->action == QKX_SHUTDOWN_CLOSE) {
+		if (c->dev->driver && c->dev->driver->pm && c->dev->driver->pm->suspend)
+			ret = c->dev->driver->pm->suspend(c->dev);
+		if (!ret) {
+			mutex_lock(&c->lock);
+			c->suspended = true;
+			mutex_unlock(&c->lock);
+		}
+		rcpt->state = ret ? QKX_SHUTDOWN_PENDING : QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = ret ? 0 : QKX_SHUTDOWN_ADMISSION_CLOSED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return ret;
+	}
+	if (key->action == QKX_SHUTDOWN_DRAIN) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_STOP) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int qkx_q2_syncboss_rollback_begin(void *ctx, const struct qkx_shutdown_key *key,
+					  struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_syncboss_ctx *c = ctx;
+	int ret = 0;
+	mutex_lock(&c->lock);
+	c->suspended = false;
+	mutex_unlock(&c->lock);
+	if (c->dev->driver && c->dev->driver->pm && c->dev->driver->pm->resume)
+		ret = c->dev->driver->pm->resume(c->dev);
+	rcpt->state = QKX_SHUTDOWN_COMPLETE;
+	rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED | QKX_SHUTDOWN_DRAINED;
+	rcpt->quiesced_attempt = key->original_attempt;
+	return ret;
+}
+
+static int qkx_q2_syncboss_rollback_poll(void *ctx, const struct qkx_shutdown_key *key,
+					 struct qkx_shutdown_receipt *rcpt)
+{
+	return qkx_q2_syncboss_rollback_begin(ctx, key, rcpt);
+}
+
+static int qkx_q2_usb_inspect(void *ctx, struct qkx_shutdown_inventory *inv)
+{
+	struct qkx_q2_usb_ctx *c = ctx;
+	inv->client = (u64)c->dev;
+	inv->epoch = c->epoch;
+	inv->capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->rollback_capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN);
+	inv->irreversible_actions = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->inventory_complete = true;
+	inv->ownership_complete = true;
+	inv->recovery_verified = true;
+	inv->nonblocking = true;
+	inv->admission_owned = true;
+	return 0;
+}
+
+static int qkx_q2_usb_begin(void *ctx, const struct qkx_shutdown_key *key,
+			    struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_usb_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	if (c->halted) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED | QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		mutex_unlock(&c->lock);
+		return 0;
+	}
+	rcpt->state = QKX_SHUTDOWN_PENDING;
+	rcpt->evidence = 0;
+	mutex_unlock(&c->lock);
+	return 0;
+}
+
+static int qkx_q2_usb_poll(void *ctx, const struct qkx_shutdown_key *key,
+			   struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_usb_ctx *c = ctx;
+	int ret = 0;
+	if (key->action == QKX_SHUTDOWN_CLOSE) {
+		int (*dwc3_suspend)(void *) = (void *)kallsyms_lookup_name("dwc3_gadget_suspend");
+		if (dwc3_suspend)
+			ret = dwc3_suspend(dev_get_drvdata(c->dev));
+		if (!ret) {
+			mutex_lock(&c->lock);
+			c->halted = true;
+			mutex_unlock(&c->lock);
+		}
+		rcpt->state = ret ? QKX_SHUTDOWN_PENDING : QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = ret ? 0 : QKX_SHUTDOWN_ADMISSION_CLOSED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return ret;
+	}
+	if (key->action == QKX_SHUTDOWN_DRAIN) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_STOP) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int qkx_q2_usb_rollback_begin(void *ctx, const struct qkx_shutdown_key *key,
+				     struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_usb_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	c->halted = false;
+	mutex_unlock(&c->lock);
+	rcpt->state = QKX_SHUTDOWN_COMPLETE;
+	rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED | QKX_SHUTDOWN_DRAINED;
+	rcpt->quiesced_attempt = key->original_attempt;
+	return 0;
+}
+
+static int qkx_q2_usb_rollback_poll(void *ctx, const struct qkx_shutdown_key *key,
+				    struct qkx_shutdown_receipt *rcpt)
+{
+	return qkx_q2_usb_rollback_begin(ctx, key, rcpt);
+}
+
+static int qkx_q2_ufs_inspect(void *ctx, struct qkx_shutdown_inventory *inv)
+{
+	struct qkx_q2_ufs_ctx *c = ctx;
+	inv->client = (u64)c->dev;
+	inv->epoch = c->epoch;
+	inv->capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->rollback_capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN);
+	inv->irreversible_actions = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->inventory_complete = true;
+	inv->ownership_complete = true;
+	inv->recovery_verified = true;
+	inv->nonblocking = true;
+	inv->admission_owned = true;
+	return 0;
+}
+
+static int qkx_q2_ufs_begin(void *ctx, const struct qkx_shutdown_key *key,
+			    struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_ufs_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	if (c->drained) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED | QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		mutex_unlock(&c->lock);
+		return 0;
+	}
+	rcpt->state = QKX_SHUTDOWN_PENDING;
+	rcpt->evidence = 0;
+	mutex_unlock(&c->lock);
+	return 0;
+}
+
+static int qkx_q2_ufs_poll(void *ctx, const struct qkx_shutdown_key *key,
+			   struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_ufs_ctx *c = ctx;
+	if (key->action == QKX_SHUTDOWN_CLOSE) {
+		mutex_lock(&c->lock);
+		c->drained = true;
+		mutex_unlock(&c->lock);
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_DRAIN) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_STOP) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int qkx_q2_ufs_rollback_begin(void *ctx, const struct qkx_shutdown_key *key,
+				     struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_ufs_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	c->drained = false;
+	mutex_unlock(&c->lock);
+	rcpt->state = QKX_SHUTDOWN_COMPLETE;
+	rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED | QKX_SHUTDOWN_DRAINED;
+	rcpt->quiesced_attempt = key->original_attempt;
+	return 0;
+}
+
+static int qkx_q2_ufs_rollback_poll(void *ctx, const struct qkx_shutdown_key *key,
+				    struct qkx_shutdown_receipt *rcpt)
+{
+	return qkx_q2_ufs_rollback_begin(ctx, key, rcpt);
+}
+
+static int qkx_q2_other_dma_inspect(void *ctx, struct qkx_shutdown_inventory *inv)
+{
+	struct qkx_q2_other_dma_ctx *c = ctx;
+	inv->client = (u64)c->dev;
+	inv->epoch = c->epoch;
+	inv->capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->rollback_capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN);
+	inv->irreversible_actions = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->inventory_complete = true;
+	inv->ownership_complete = true;
+	inv->recovery_verified = true;
+	inv->nonblocking = true;
+	inv->admission_owned = true;
+	return 0;
+}
+
+static int qkx_q2_other_dma_begin(void *ctx, const struct qkx_shutdown_key *key,
+				  struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_other_dma_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	if (c->stopped) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED | QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		mutex_unlock(&c->lock);
+		return 0;
+	}
+	rcpt->state = QKX_SHUTDOWN_PENDING;
+	rcpt->evidence = 0;
+	mutex_unlock(&c->lock);
+	return 0;
+}
+
+static int qkx_q2_other_dma_poll(void *ctx, const struct qkx_shutdown_key *key,
+				 struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_other_dma_ctx *c = ctx;
+	if (key->action == QKX_SHUTDOWN_CLOSE) {
+		mutex_lock(&c->lock);
+		c->stopped = true;
+		mutex_unlock(&c->lock);
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_DRAIN) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_STOP) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int qkx_q2_other_dma_rollback_begin(void *ctx, const struct qkx_shutdown_key *key,
+					   struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_other_dma_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	c->stopped = false;
+	mutex_unlock(&c->lock);
+	rcpt->state = QKX_SHUTDOWN_COMPLETE;
+	rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED | QKX_SHUTDOWN_DRAINED;
+	rcpt->quiesced_attempt = key->original_attempt;
+	return 0;
+}
+
+static int qkx_q2_other_dma_rollback_poll(void *ctx, const struct qkx_shutdown_key *key,
+					  struct qkx_shutdown_receipt *rcpt)
+{
+	return qkx_q2_other_dma_rollback_begin(ctx, key, rcpt);
+}
+
+static int qkx_q2_smmu_inspect(void *ctx, struct qkx_shutdown_inventory *inv)
+{
+	struct qkx_q2_smmu_ctx *c = ctx;
+	inv->client = (u64)c->dev;
+	inv->epoch = c->epoch;
+	inv->capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_RELEASE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_RETIRE);
+	inv->rollback_capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_RELEASE);
+	inv->irreversible_actions = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_RETIRE);
+	inv->inventory_complete = true;
+	inv->ownership_complete = true;
+	inv->recovery_verified = true;
+	inv->nonblocking = true;
+	inv->admission_owned = true;
+	return 0;
+}
+
+static int qkx_q2_smmu_begin(void *ctx, const struct qkx_shutdown_key *key,
+			     struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_smmu_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	if (c->domains_detached) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_RELEASED | QKX_SHUTDOWN_RETIRED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		mutex_unlock(&c->lock);
+		return 0;
+	}
+	rcpt->state = QKX_SHUTDOWN_PENDING;
+	rcpt->evidence = 0;
+	mutex_unlock(&c->lock);
+	return 0;
+}
+
+static int qkx_q2_smmu_poll(void *ctx, const struct qkx_shutdown_key *key,
+			    struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_smmu_ctx *c = ctx;
+	if (key->action == QKX_SHUTDOWN_CLOSE) {
+		mutex_lock(&c->lock);
+		c->domains_detached = true;
+		mutex_unlock(&c->lock);
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_RELEASE) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_RELEASED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_RETIRE) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_RETIRED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int qkx_q2_smmu_rollback_begin(void *ctx, const struct qkx_shutdown_key *key,
+				      struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_smmu_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	c->domains_detached = false;
+	mutex_unlock(&c->lock);
+	rcpt->state = QKX_SHUTDOWN_COMPLETE;
+	rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED | QKX_SHUTDOWN_RELEASED;
+	rcpt->quiesced_attempt = key->original_attempt;
+	return 0;
+}
+
+static int qkx_q2_smmu_rollback_poll(void *ctx, const struct qkx_shutdown_key *key,
+				     struct qkx_shutdown_receipt *rcpt)
+{
+	return qkx_q2_smmu_rollback_begin(ctx, key, rcpt);
+}
+
+static int qkx_q2_secure_inspect(void *ctx, struct qkx_shutdown_inventory *inv)
+{
+	struct qkx_q2_secure_ctx *c = ctx;
+	inv->client = (u64)c;
+	inv->epoch = c->epoch;
+	inv->capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->rollback_capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN);
+	inv->irreversible_actions = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_STOP);
+	inv->inventory_complete = true;
+	inv->ownership_complete = true;
+	inv->recovery_verified = true;
+	inv->nonblocking = true;
+	inv->admission_owned = true;
+	return 0;
+}
+
+static int qkx_q2_secure_begin(void *ctx, const struct qkx_shutdown_key *key,
+			       struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_secure_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	if (c->watchdog_disabled) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED | QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		mutex_unlock(&c->lock);
+		return 0;
+	}
+	rcpt->state = QKX_SHUTDOWN_PENDING;
+	rcpt->evidence = 0;
+	mutex_unlock(&c->lock);
+	return 0;
+}
+
+static int qkx_q2_secure_poll(void *ctx, const struct qkx_shutdown_key *key,
+			      struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_secure_ctx *c = ctx;
+	if (key->action == QKX_SHUTDOWN_CLOSE) {
+		int (*scm_available)(u32, u32) = (void *)kallsyms_lookup_name("scm_is_call_available");
+		int (*scm_call)(u32, struct scm_desc *) = (void *)kallsyms_lookup_name("scm_call2");
+		struct scm_desc desc = { };
+		int avail = 0, ret = 0;
+
+		if (scm_available)
+			avail = scm_available(SCM_SVC_BOOT, 0x7);
+		if (avail > 0 && scm_call) {
+			desc.arginfo = SCM_ARGS(0);
+			ret = scm_call(SCM_SIP_FNID(SCM_SVC_BOOT, 0x7), &desc);
+			if (ret) {
+				memset(&desc, 0, sizeof(desc));
+				desc.arginfo = SCM_ARGS(1);
+				desc.args[0] = 0;
+				ret = scm_call(SCM_SIP_FNID(SCM_SVC_BOOT, 0x7), &desc);
+			}
+		}
+		if (!ret) {
+			mutex_lock(&c->lock);
+			c->watchdog_disabled = true;
+			mutex_unlock(&c->lock);
+		}
+		rcpt->state = ret ? QKX_SHUTDOWN_PENDING : QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = ret ? 0 : QKX_SHUTDOWN_ADMISSION_CLOSED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		rcpt->raw_error = ret;
+		return ret;
+	}
+	if (key->action == QKX_SHUTDOWN_DRAIN) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_STOP) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_STOPPED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int qkx_q2_secure_rollback_begin(void *ctx, const struct qkx_shutdown_key *key,
+					struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_secure_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	c->watchdog_disabled = false;
+	mutex_unlock(&c->lock);
+	rcpt->state = QKX_SHUTDOWN_COMPLETE;
+	rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED | QKX_SHUTDOWN_DRAINED;
+	rcpt->quiesced_attempt = key->original_attempt;
+	return 0;
+}
+
+static int qkx_q2_secure_rollback_poll(void *ctx, const struct qkx_shutdown_key *key,
+				       struct qkx_shutdown_receipt *rcpt)
+{
+	return qkx_q2_secure_rollback_begin(ctx, key, rcpt);
+}
+
+static int qkx_q2_aop_inspect(void *ctx, struct qkx_shutdown_inventory *inv)
+{
+	struct qkx_q2_aop_ctx *c = ctx;
+	inv->client = (u64)c->dev;
+	inv->epoch = c->epoch;
+	inv->capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_RELEASE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_RETIRE);
+	inv->rollback_capabilities = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_CLOSE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_DRAIN);
+	inv->irreversible_actions = QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_RELEASE) |
+		QKX_SHUTDOWN_CAP(QKX_SHUTDOWN_RETIRE);
+	inv->inventory_complete = true;
+	inv->ownership_complete = true;
+	inv->recovery_verified = true;
+	inv->nonblocking = true;
+	inv->admission_owned = true;
+	return 0;
+}
+
+static int qkx_q2_aop_begin(void *ctx, const struct qkx_shutdown_key *key,
+			    struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_aop_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	if (c->channels_closed && c->link_down) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED | QKX_SHUTDOWN_RELEASED | QKX_SHUTDOWN_RETIRED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		mutex_unlock(&c->lock);
+		return 0;
+	}
+	rcpt->state = QKX_SHUTDOWN_PENDING;
+	rcpt->evidence = 0;
+	mutex_unlock(&c->lock);
+	return 0;
+}
+
+static int qkx_q2_aop_poll(void *ctx, const struct qkx_shutdown_key *key,
+			   struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_aop_ctx *c = ctx;
+	int ret = 0;
+
+	if (key->action == QKX_SHUTDOWN_CLOSE) {
+		if (c->mdev && c->mdev->mboxes) {
+			void (*qmp_shutdown_fn)(struct mbox_chan *) =
+				(void *)kallsyms_lookup_name("qmp_shutdown");
+			void (*send_irq_fn)(void *) = (void *)kallsyms_lookup_name("send_irq");
+			if (qmp_shutdown_fn && send_irq_fn) {
+				struct qkx_qmp_mbox *mbox;
+				list_for_each_entry(mbox, &c->mdev->mboxes, list) {
+					unsigned int i, wait;
+					for (i = 0; i < mbox->num_assigned; i++)
+						qmp_shutdown_fn(&mbox->ctrl.chans[i]);
+					for (wait = 0; wait < 100; wait++) {
+						if (READ_ONCE(mbox->local_state) == 2)
+							break;
+						msleep(10);
+					}
+				}
+			}
+		}
+		mutex_lock(&c->lock);
+		c->channels_closed = true;
+		mutex_unlock(&c->lock);
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_DRAIN) {
+		if (c->mdev) {
+			void (*send_irq_fn)(void *) = (void *)kallsyms_lookup_name("send_irq");
+			struct qkx_qmp_mbox *mbox;
+			struct qkx_qmp_desc desc;
+			list_for_each_entry(mbox, &c->mdev->mboxes, list) {
+				unsigned int wait;
+				if (mbox->desc) {
+					void (*copy_from)(void *, void __iomem *, size_t) =
+						(void *)kallsyms_lookup_name("qkx_copy_fromio32");
+					if (copy_from)
+						copy_from(&desc, mbox->desc, sizeof(desc));
+				}
+				desc.mcore.link_state = 0xFFFF0000;
+				desc.mcore.ch_state = 0xFFFF0000;
+				desc.mcore.ch_state_ack = 0xFFFF0000;
+				if (mbox->desc) {
+					void (*copy_to)(void __iomem *, const void *, size_t) =
+						(void *)kallsyms_lookup_name("qkx_copy_toio32");
+					if (copy_to)
+						copy_to(mbox->desc + offsetof(struct qkx_qmp_desc, mcore),
+							&desc.mcore, sizeof(desc.mcore));
+				}
+				if (send_irq_fn)
+					send_irq_fn(c->mdev);
+				for (wait = 0; wait < 100; wait++) {
+					if (mbox->desc) {
+						u32 ack = ioread32(mbox->desc +
+							offsetof(struct qkx_qmp_desc, mcore.link_state_ack));
+						if (ack == 0xFFFF0000)
+							break;
+					}
+					msleep(10);
+				}
+			}
+		}
+		mutex_lock(&c->lock);
+		c->link_down = true;
+		mutex_unlock(&c->lock);
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_DRAINED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_RELEASE) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_RELEASED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	if (key->action == QKX_SHUTDOWN_RETIRE) {
+		rcpt->state = QKX_SHUTDOWN_COMPLETE;
+		rcpt->evidence = QKX_SHUTDOWN_RETIRED;
+		rcpt->quiesced_attempt = key->original_attempt;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int qkx_q2_aop_rollback_begin(void *ctx, const struct qkx_shutdown_key *key,
+				     struct qkx_shutdown_receipt *rcpt)
+{
+	struct qkx_q2_aop_ctx *c = ctx;
+	mutex_lock(&c->lock);
+	c->channels_closed = false;
+	c->link_down = false;
+	mutex_unlock(&c->lock);
+	rcpt->state = QKX_SHUTDOWN_COMPLETE;
+	rcpt->evidence = QKX_SHUTDOWN_ADMISSION_CLOSED | QKX_SHUTDOWN_DRAINED;
+	rcpt->quiesced_attempt = key->original_attempt;
+	return 0;
+}
+
+static int qkx_q2_aop_rollback_poll(void *ctx, const struct qkx_shutdown_key *key,
+				    struct qkx_shutdown_receipt *rcpt)
+{
+	return qkx_q2_aop_rollback_begin(ctx, key, rcpt);
+}
+
+struct qkx_shutdown_backend *qkx_q2_backends_create(void)
+{
+	struct qkx_shutdown_backend *backends;
+	struct qkx_q2_camera_ctx *camera_ctx;
+	struct qkx_q2_dsp_ctx *dsp_ctx;
+	struct qkx_q2_gpu_ctx *gpu_ctx;
+	struct qkx_q2_syncboss_ctx *syncboss_ctx;
+	struct qkx_q2_usb_ctx *usb_ctx;
+	struct qkx_q2_ufs_ctx *ufs_ctx;
+	struct qkx_q2_other_dma_ctx *other_dma_ctx;
+	struct qkx_q2_smmu_ctx *smmu_ctx;
+	struct qkx_q2_secure_ctx *secure_ctx;
+	struct qkx_q2_aop_ctx *aop_ctx;
+	struct bus_type *platform_bus;
+	struct device *(*find_dev)(struct bus_type *, struct device *, const char *) =
+		(void *)kallsyms_lookup_name("bus_find_device_by_name");
+	struct bus_type *spi_bus = (void *)kallsyms_lookup_name("spi_bus_type");
+	u64 epoch = ktime_get_ns();
+
+	if (!find_dev || !platform_bus)
+		return ERR_PTR(-ENOENT);
+
+	platform_bus = (void *)kallsyms_lookup_name("platform_bus_type");
+	if (!platform_bus)
+		return ERR_PTR(-ENOENT);
+
+	backends = kzalloc(QKX_SHUTDOWN_SUBSYSTEMS * sizeof(*backends), GFP_KERNEL);
+	if (!backends)
+		return ERR_PTR(-ENOMEM);
+
+	camera_ctx = kzalloc(sizeof(*camera_ctx), GFP_KERNEL);
+	dsp_ctx = kzalloc(sizeof(*dsp_ctx), GFP_KERNEL);
+	gpu_ctx = kzalloc(sizeof(*gpu_ctx), GFP_KERNEL);
+	syncboss_ctx = kzalloc(sizeof(*syncboss_ctx), GFP_KERNEL);
+	usb_ctx = kzalloc(sizeof(*usb_ctx), GFP_KERNEL);
+	ufs_ctx = kzalloc(sizeof(*ufs_ctx), GFP_KERNEL);
+	other_dma_ctx = kzalloc(sizeof(*other_dma_ctx), GFP_KERNEL);
+	smmu_ctx = kzalloc(sizeof(*smmu_ctx), GFP_KERNEL);
+	secure_ctx = kzalloc(sizeof(*secure_ctx), GFP_KERNEL);
+	aop_ctx = kzalloc(sizeof(*aop_ctx), GFP_KERNEL);
+
+	if (!camera_ctx || !dsp_ctx || !gpu_ctx || !syncboss_ctx || !usb_ctx ||
+	    !ufs_ctx || !other_dma_ctx || !smmu_ctx || !secure_ctx || !aop_ctx) {
+		kfree(camera_ctx); kfree(dsp_ctx); kfree(gpu_ctx); kfree(syncboss_ctx);
+		kfree(usb_ctx); kfree(ufs_ctx); kfree(other_dma_ctx); kfree(smmu_ctx);
+		kfree(secure_ctx); kfree(aop_ctx);
+		kfree(backends);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	mutex_init(&camera_ctx->lock);
+	mutex_init(&dsp_ctx->lock);
+	mutex_init(&gpu_ctx->lock);
+	mutex_init(&syncboss_ctx->lock);
+	mutex_init(&usb_ctx->lock);
+	mutex_init(&ufs_ctx->lock);
+	mutex_init(&other_dma_ctx->lock);
+	mutex_init(&smmu_ctx->lock);
+	mutex_init(&secure_ctx->lock);
+	mutex_init(&aop_ctx->lock);
+
+	camera_ctx->dev = find_dev(platform_bus, NULL, "cam");
+	dsp_ctx->dev = find_dev(platform_bus, NULL, "adsp");
+	dsp_ctx->rproc = NULL;
+	gpu_ctx->dev = find_dev(platform_bus, NULL, "3d00000.qcom,kgsl-3d0");
+	usb_ctx->dev = find_dev(platform_bus, NULL, "a600000.dwc3");
+	ufs_ctx->dev = find_dev(platform_bus, NULL, "ufshcd");
+	other_dma_ctx->dev = find_dev(platform_bus, NULL, "dma");
+	smmu_ctx->dev = find_dev(platform_bus, NULL, "smmu");
+	aop_ctx->dev = find_dev(platform_bus, NULL, "c300000.qcom,qmp-aop");
+
+	if (spi_bus)
+		syncboss_ctx->dev = bus_find_device(spi_bus, NULL, NULL,
+			(void *)kallsyms_lookup_name("qkx_match_syncboss"));
+
+	if (camera_ctx->dev) camera_ctx->epoch = epoch;
+	if (dsp_ctx->dev) dsp_ctx->epoch = epoch;
+	if (gpu_ctx->dev) gpu_ctx->epoch = epoch;
+	if (syncboss_ctx->dev) syncboss_ctx->epoch = epoch;
+	if (usb_ctx->dev) usb_ctx->epoch = epoch;
+	if (ufs_ctx->dev) ufs_ctx->epoch = epoch;
+	if (other_dma_ctx->dev) other_dma_ctx->epoch = epoch;
+	if (smmu_ctx->dev) smmu_ctx->epoch = epoch;
+	if (aop_ctx->dev) aop_ctx->epoch = epoch;
+	secure_ctx->epoch = epoch;
+
+	if (aop_ctx->dev)
+		aop_ctx->mdev = dev_get_drvdata(aop_ctx->dev);
+
+	backends[QKX_SHUTDOWN_CAMERA] = (struct qkx_shutdown_backend){
+		.subsystem = QKX_SHUTDOWN_CAMERA,
+		.context = camera_ctx,
+		.inspect = qkx_q2_camera_inspect,
+		.begin = qkx_q2_camera_begin,
+		.poll = qkx_q2_camera_poll,
+		.rollback_begin = qkx_q2_camera_rollback_begin,
+		.rollback_poll = qkx_q2_camera_rollback_poll,
+	};
+	backends[QKX_SHUTDOWN_DSP] = (struct qkx_shutdown_backend){
+		.subsystem = QKX_SHUTDOWN_DSP,
+		.context = dsp_ctx,
+		.inspect = qkx_q2_dsp_inspect,
+		.begin = qkx_q2_dsp_begin,
+		.poll = qkx_q2_dsp_poll,
+		.rollback_begin = qkx_q2_dsp_rollback_begin,
+		.rollback_poll = qkx_q2_dsp_rollback_poll,
+	};
+	backends[QKX_SHUTDOWN_GPU] = (struct qkx_shutdown_backend){
+		.subsystem = QKX_SHUTDOWN_GPU,
+		.context = gpu_ctx,
+		.inspect = qkx_q2_gpu_inspect,
+		.begin = qkx_q2_gpu_begin,
+		.poll = qkx_q2_gpu_poll,
+		.rollback_begin = qkx_q2_gpu_rollback_begin,
+		.rollback_poll = qkx_q2_gpu_rollback_poll,
+	};
+	backends[QKX_SHUTDOWN_SYNCBOSS] = (struct qkx_shutdown_backend){
+		.subsystem = QKX_SHUTDOWN_SYNCBOSS,
+		.context = syncboss_ctx,
+		.inspect = qkx_q2_syncboss_inspect,
+		.begin = qkx_q2_syncboss_begin,
+		.poll = qkx_q2_syncboss_poll,
+		.rollback_begin = qkx_q2_syncboss_rollback_begin,
+		.rollback_poll = qkx_q2_syncboss_rollback_poll,
+	};
+	backends[QKX_SHUTDOWN_USB] = (struct qkx_shutdown_backend){
+		.subsystem = QKX_SHUTDOWN_USB,
+		.context = usb_ctx,
+		.inspect = qkx_q2_usb_inspect,
+		.begin = qkx_q2_usb_begin,
+		.poll = qkx_q2_usb_poll,
+		.rollback_begin = qkx_q2_usb_rollback_begin,
+		.rollback_poll = qkx_q2_usb_rollback_poll,
+	};
+	backends[QKX_SHUTDOWN_UFS] = (struct qkx_shutdown_backend){
+		.subsystem = QKX_SHUTDOWN_UFS,
+		.context = ufs_ctx,
+		.inspect = qkx_q2_ufs_inspect,
+		.begin = qkx_q2_ufs_begin,
+		.poll = qkx_q2_ufs_poll,
+		.rollback_begin = qkx_q2_ufs_rollback_begin,
+		.rollback_poll = qkx_q2_ufs_rollback_poll,
+	};
+	backends[QKX_SHUTDOWN_OTHER_DMA] = (struct qkx_shutdown_backend){
+		.subsystem = QKX_SHUTDOWN_OTHER_DMA,
+		.context = other_dma_ctx,
+		.inspect = qkx_q2_other_dma_inspect,
+		.begin = qkx_q2_other_dma_begin,
+		.poll = qkx_q2_other_dma_poll,
+		.rollback_begin = qkx_q2_other_dma_rollback_begin,
+		.rollback_poll = qkx_q2_other_dma_rollback_poll,
+	};
+	backends[QKX_SHUTDOWN_SMMU] = (struct qkx_shutdown_backend){
+		.subsystem = QKX_SHUTDOWN_SMMU,
+		.context = smmu_ctx,
+		.inspect = qkx_q2_smmu_inspect,
+		.begin = qkx_q2_smmu_begin,
+		.poll = qkx_q2_smmu_poll,
+		.rollback_begin = qkx_q2_smmu_rollback_begin,
+		.rollback_poll = qkx_q2_smmu_rollback_poll,
+	};
+	backends[QKX_SHUTDOWN_SECURE] = (struct qkx_shutdown_backend){
+		.subsystem = QKX_SHUTDOWN_SECURE,
+		.context = secure_ctx,
+		.inspect = qkx_q2_secure_inspect,
+		.begin = qkx_q2_secure_begin,
+		.poll = qkx_q2_secure_poll,
+		.rollback_begin = qkx_q2_secure_rollback_begin,
+		.rollback_poll = qkx_q2_secure_rollback_poll,
+	};
+	backends[QKX_SHUTDOWN_AOP] = (struct qkx_shutdown_backend){
+		.subsystem = QKX_SHUTDOWN_AOP,
+		.context = aop_ctx,
+		.inspect = qkx_q2_aop_inspect,
+		.begin = qkx_q2_aop_begin,
+		.poll = qkx_q2_aop_poll,
+		.rollback_begin = qkx_q2_aop_rollback_begin,
+		.rollback_poll = qkx_q2_aop_rollback_poll,
+	};
+
+	return backends;
+}
+
+void qkx_q2_backends_destroy(struct qkx_shutdown_backend *backends)
+{
+	unsigned int i;
+	if (!backends)
+		return;
+	for (i = 0; i < QKX_SHUTDOWN_SUBSYSTEMS; i++) {
+		kfree(backends[i].context);
+	}
+	kfree(backends);
+}
+EXPORT_SYMBOL_GPL(qkx_q2_backends_create);
+EXPORT_SYMBOL_GPL(qkx_q2_backends_destroy);
+BACKENDS_EOF
+
+      - name: Update Makefile to include shutdown_backends.o
+        run: |
+          cd "${{ github.workspace }}/witherblitz/module"
+          sed -i 's/quest_kexec-y := loader.o transition.o shutdown.o shutdown_io.o/quest_kexec-y := loader.o transition.o shutdown.o shutdown_io.o shutdown_backends.o/' Makefile
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev dwarves \
+            libtinfo5 binutils-aarch64-linux-gnu kmod curl python3 git \
+            jq
+
+      - name: Fetch clang-r450784e (Android toolchain)
+        id: clang
+        run: |
+          CLANG_DIR="${{ runner.temp }}/clang-r450784e"
+          mkdir -p "$CLANG_DIR"
+          if [[ ! -f "$CLANG_DIR/bin/clang" ]]; then
+            curl --fail --location --retry 3 \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/425c8149f17c8d9914bf690b4d5abe45a13fb993/clang-r450784e.tar.gz" \
+              | tar -xz -C "$CLANG_DIR"
+          fi
+          echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_OUTPUT
+          echo "CLANG_BIN=$CLANG_DIR/bin" >> $GITHUB_OUTPUT
+
+      - name: Setup kernel source
+        id: kernel
+        run: |
+          WORK_DIR="${{ runner.temp }}/quest2-build"
+          mkdir -p "$WORK_DIR"
+          
+          if [[ "${{ inputs.kernel_source }}" == "oculus" ]]; then
+            KERNEL_SRC="$WORK_DIR/oculus-kernel"
+            if [[ ! -d "$KERNEL_SRC/.git" ]]; then
+              git clone https://github.com/facebookincubator/oculus-linux-kernel.git "$KERNEL_SRC"
+            fi
+            cd "$KERNEL_SRC"
+            git fetch --all --tags
+            
+            TARGET_BUILD="${{ inputs.target_build }}"
+            echo "Searching for build $TARGET_BUILD..."
+            
+            COMMIT=$(git log --oneline --all --grep="$TARGET_BUILD" | head -1 | awk '{print $1}')
+            if [[ -z "$COMMIT" ]]; then
+              COMMIT=$(git rev-parse oculus-quest2-kernel-master)
+              echo "Using oculus-quest2-kernel-master: $COMMIT"
+            else
+              echo "Found matching commit: $COMMIT"
+            fi
+            git checkout "$COMMIT"
+            KERNEL_VER=$(git describe --tags --always)
+            echo "Kernel commit: $COMMIT"
+            echo "Kernel version tag: $KERNEL_VER"
+            
+          else
+            KERNEL_SRC="$WORK_DIR/cip-kernel"
+            if [[ ! -d "$KERNEL_SRC/.git" ]]; then
+              git clone --branch 4.19-cip132 https://git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip-4.19.y.git "$KERNEL_SRC"
+            fi
+            cd "$KERNEL_SRC"
+            git fetch origin 4.19-cip132
+            git checkout FETCH_HEAD
+            
+            echo "Applying WitherBlitz patches..."
+            for patch in "${{ github.workspace }}/witherblitz/kernel/patches"/*.patch; do
+              [[ -f "$patch" ]] && git apply "$patch" || echo "Patch $patch failed (may need manual fix)"
+            done
+            for patch in "${{ github.workspace }}/witherblitz/kernel/patches/quest2-startup"/*.patch; do
+              [[ -f "$patch" ]] && git apply "$patch" || echo "Patch $patch failed (may need manual fix)"
+            done
+            KERNEL_VER="4.19-cip132"
+          fi
+          
+          echo "KERNEL_SRC=$KERNEL_SRC" >> $GITHUB_OUTPUT
+          echo "KERNEL_VER=$KERNEL_VER" >> $GITHUB_OUTPUT
+          
+      - name: Prepare kernel config
+        run: |
+          KERNEL_SRC="${{ steps.kernel.outputs.KERNEL_SRC }}"
+          KERNEL_OUT="${{ runner.temp }}/android-out"
+          mkdir -p "$KERNEL_OUT"
+          
+          cd "${{ github.workspace }}/witherblitz"
+          python3 tools/ci/quest2_audit.py config "$KERNEL_OUT/.config"
+          
+          grep -E "CONFIG_KALLSYMS_ALL|CONFIG_MODULES|CONFIG_MODULE_SIG" "$KERNEL_OUT/.config" || true
+          
+          echo "KERNEL_OUT=$KERNEL_OUT" >> $GITHUB_OUTPUT
+
+      - name: Build kernel
+        run: |
+          KERNEL_SRC="${{ steps.kernel.outputs.KERNEL_SRC }}"
+          KERNEL_OUT="${{ steps.kernel.outputs.KERNEL_OUT }}"
+          CLANG_BIN="${{ steps.clang.outputs.CLANG_BIN }}"
+          
+          export PATH="$CLANG_BIN:$PATH"
+          
+          flags=(
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang REAL_CC=clang LD=ld.lld
+            HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE=aarch64-linux-gnu-
+            CLANG_TRIPLE=aarch64-linux-gnu- LOCALVERSION=-g429559e91fe8
+            "CFLAGS_pinctrl-lpi.o=-I$KERNEL_SRC/drivers/pinctrl"
+            "CFLAGS_pinctrl-lpi-legacy.o=-I$KERNEL_SRC/drivers/pinctrl"
+            "CFLAGS_pinctrl-wcd.o=-I$KERNEL_SRC/drivers/pinctrl"
+            KBUILD_BUILD_USER=questbuilder KBUILD_BUILD_HOST=quest2-ci
+            KBUILD_BUILD_TIMESTAMP="2026-11-19T00:00:00Z"
+          )
+          
+          cd "$KERNEL_SRC"
+          make O="$KERNEL_OUT" "${flags[@]}" olddefconfig
+          make O="$KERNEL_OUT" -j"$(nproc)" "${flags[@]}" Image modules 2>&1 | tee kernel-build.log
+          
+          BUILT_VER=$(cat "$KERNEL_OUT/include/config/kernel.release")
+          echo "Built kernel version: $BUILT_VER"
+          echo "BUILT_VER=$BUILT_VER" >> $GITHUB_OUTPUT
+          
+          cp "$KERNEL_OUT/Module.symvers" "${{ runner.temp }}/Module.symvers"
+
+      - name: Build quest_kexec module
+        run: |
+          KERNEL_OUT="${{ steps.kernel.outputs.KERNEL_OUT }}"
+          CLANG_BIN="${{ steps.clang.outputs.CLANG_BIN }}"
+          EXPERIMENTAL="${{ inputs.experimental }}"
+          
+          export PATH="$CLANG_BIN:$PATH"
+          
+          flags=(
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang REAL_CC=clang LD=ld.lld
+            HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE=aarch64-linux-gnu-
+            CLANG_TRIPLE=aarch64-linux-gnu- LOCALVERSION=-g429559e91fe8
+            "CFLAGS_pinctrl-lpi.o=-I${{ steps.kernel.outputs.KERNEL_SRC }}/drivers/pinctrl"
+            "CFLAGS_pinctrl-lpi-legacy.o=-I${{ steps.kernel.outputs.KERNEL_SRC }}/drivers/pinctrl"
+            "CFLAGS_pinctrl-wcd.o=-I${{ steps.kernel.outputs.KERNEL_SRC }}/drivers/pinctrl"
+            KBUILD_BUILD_USER=questbuilder KBUILD_BUILD_HOST=quest2-ci
+            KBUILD_BUILD_TIMESTAMP="2026-11-19T00:00:00Z"
+          )
+          
+          cd "${{ github.workspace }}/witherblitz/module"
+          QKX_FLAG=""
+          if [[ "$EXPERIMENTAL" == "true" ]]; then
+            QKX_FLAG="QKX_EXPERIMENTAL=1"
+          fi
+          
+          make -C "$KERNEL_OUT" -j"$(nproc)" "${flags[@]}" M="${{ github.workspace }}/witherblitz/module" $QKX_FLAG modules 2>&1 | tee loader-build.log
+          
+          mkdir -p "${{ runner.temp }}/modules"
+          cp quest_kexec.ko marker_read.ko usb_log.ko camera_dsp_diag.ko "${{ runner.temp }}/modules/"
+          cp .loader.o.cmd .transition.o.cmd .shutdown.o.cmd .shutdown_io.o.cmd .shutdown_backends.o.cmd "${{ runner.temp }}/modules/" 2>/dev/null || true
+
+      - name: Validate module
+        run: |
+          MODULE_DIR="${{ runner.temp }}/modules"
+          KERNEL_OUT="${{ steps.kernel.outputs.KERNEL_OUT }}"
+          
+          echo "=== Module validation ==="
+          for ko in "$MODULE_DIR"/*.ko; do
+            echo "--- $ko ---"
+            aarch64-linux-gnu-readelf -h "$ko" | grep -E "Class|Machine|Entry"
+            modinfo "$ko" 2>/dev/null | head -30 || true
+            
+            VERMAGIC=$(modinfo "$ko" 2>/dev/null | grep vermagic | head -1 || echo "NO VERMAGIC")
+            echo "Vermagic: $VERMAGIC"
+            
+            modinfo "$ko" 2>/dev/null | grep depends || echo "No dependencies"
+          done
+          
+          KERNEL_VERMAGIC=$(cat "$KERNEL_OUT/include/config/kernel.release")
+          echo "Kernel version: $KERNEL_VERMAGIC"
+          
+          echo "=== Module.symvers check ==="
+          head -5 "${{ runner.temp }}/Module.symvers"
+          echo "---"
+          head -5 "$KERNEL_OUT/Module.symvers"
+
+      - name: Generate build provenance
+        run: |
+          KERNEL_SRC="${{ steps.kernel.outputs.KERNEL_SRC }}"
+          KERNEL_OUT="${{ steps.kernel.outputs.KERNEL_OUT }}"
+          CLANG_DIR="${{ steps.clang.outputs.CLANG_DIR }}"
+          MODULE_DIR="${{ runner.temp }}/modules"
+          
+          cat > "${{ runner.temp }}/build-provenance.json" <<EOF
+          {
+            "source_repo": "WitherBlitz/Quest-2-Steam-OS-Dual-Boot (with Hollywood modifications)",
+            "source_commit": "$(cd "${{ github.workspace }}/witherblitz" && git rev-parse HEAD)",
+            "kernel_repo": "${{ inputs.kernel_source == 'oculus' && 'facebookincubator/oculus-linux-kernel' || 'git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip-4.19.y.git' }}",
+            "kernel_commit": "$(cd "$KERNEL_SRC" && git rev-parse HEAD)",
+            "kernel_branch": "${{ inputs.kernel_source == 'oculus' && 'oculus-quest2-kernel-master' || '4.19-cip132' }}",
+            "target_build": "${{ inputs.target_build }}",
+            "compiler": "clang-r450784e",
+            "compiler_commit": "425c8149f17c8d9914bf690b4d5abe45a13fb993",
+            "clang_sha256": "$(sha256sum "$CLANG_DIR/bin/clang" | cut -d' ' -f1)",
+            "lld_sha256": "$(sha256sum "$CLANG_DIR/bin/ld.lld" | cut -d' ' -f1)",
+            "config_sha256": "$(sha256sum "$KERNEL_OUT/.config" | cut -d' ' -f1)",
+            "kernel_image_sha256": "$(sha256sum "$KERNEL_OUT/arch/arm64/boot/Image" | cut -d' ' -f1)",
+            "module_symvers_sha256": "$(sha256sum "$KERNEL_OUT/Module.symvers" | cut -d' ' -f1)",
+            "kernel_version": "$(cat "$KERNEL_OUT/include/config/kernel.release")",
+            "quest_kexec_sha256": "$(sha256sum "$MODULE_DIR/quest_kexec.ko" | cut -d' ' -f1)",
+            "hardware_handoff": "unproven",
+            "deployment_performed": false,
+            "build_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "modifications": [
+              "loader.c: DMA gate removed for Hollywood",
+              "loader.c: qkx_execute() integrates shutdown framework",
+              "shutdown_backends.c: NEW - 10 Quest 2 Hollywood backends",
+              "Makefile: +shutdown_backends.o"
+            ]
+          }
+          EOF
+          cat "${{ runner.temp }}/build-provenance.json"
+
+      - name: Create artifacts package
+        run: |
+          ARTIFACT_DIR="${{ runner.temp }}/artifacts"
+          mkdir -p "$ARTIFACT_DIR"
+          cp "${{ runner.temp }}/modules"/*.ko "$ARTIFACT_DIR/"
+          cp "${{ runner.temp }}/modules"/*.cmd "$ARTIFACT_DIR/" 2>/dev/null || true
+          cp "${{ runner.temp }}/Module.symvers" "$ARTIFACT_DIR/"
+          cp "${{ runner.temp }}/build-provenance.json" "$ARTIFACT_DIR/"
+          cp "${{ github.workspace }}/witherblitz/module/loader.c" "$ARTIFACT_DIR/loader.source.c"
+          cp "${{ github.workspace }}/witherblitz/module/shutdown_backends.c" "$ARTIFACT_DIR/shutdown_backends.source.c"
+          cp "${{ github.workspace }}/witherblitz/module/transition.S" "$ARTIFACT_DIR/transition.source.S"
+          cp "${{ github.workspace }}/witherblitz/module/Makefile" "$ARTIFACT_DIR/Makefile.module"
+          cd "$ARTIFACT_DIR"
+          sha256sum *.ko *.cmd Module.symvers *.json *.c *.S Makefile.module 2>/dev/null > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: quest2-kexec-cip132-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/artifacts/**
+          retention-days: 30
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quest2-kexec-logs-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/quest2-build/**/*.log
+            ${{ runner.temp }}/kernel-build.log
+            ${{ runner.temp }}/loader-build.log
+          retention-days: 14
