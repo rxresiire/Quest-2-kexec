@@ -36,25 +36,19 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
-    # Kconfig probes the compiler (CC_IS_CLANG, CLANG_VERSION, CC_HAS_*) and
-    # hardened defaults such as FORTIFY_SOURCE are derived from those probes.
-    # The configuration stage therefore has to see exactly the toolchain the
-    # module is compiled with, otherwise olddefconfig legitimately rewrites the
-    # audited file. These values are the single source of truth for both stages.
-    env:
-      CC: clang
-      LD: ld.lld
-      HOSTCC: clang
-      HOSTCXX: clang++
-      CROSS_COMPILE: aarch64-linux-gnu-
-      CLANG_TRIPLE: aarch64-linux-gnu-
-      KERNEL_LOCALVERSION: -g429559e91fe8
     steps:
-      - name: Export workspace paths
+      - name: Export build toolchain
         run: |
           echo "KERNEL_OUT=$RUNNER_TEMP/android-out" >> "$GITHUB_ENV"
           echo "MODULE_DIR=$RUNNER_TEMP/modules" >> "$GITHUB_ENV"
           echo "WORK_DIR=$RUNNER_TEMP/quest2-build" >> "$GITHUB_ENV"
+          echo "KERNEL_LOCALVERSION=-g429559e91fe8" >> "$GITHUB_ENV"
+          # Command-line assignments, not environment: this 4.19 tree sets
+          # CC = $(CROSS_COMPILE)gcc inside the Makefile, which wins over the
+          # environment. Kconfig probes (CC_IS_CLANG, CLANG_VERSION, CC_HAS_*,
+          # FORTIFY_SOURCE defaults) must come from the clang/LLD pair that also
+          # compiles the module, so every stage expands the same array.
+          echo "KBUILD_FLAGS=ARCH=arm64 CC=clang LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
 
       - name: Checkout WitherBlitz Quest 2 SteamOS Dual-Boot
         uses: actions/checkout@v4
@@ -145,6 +139,7 @@ jobs:
           cd "${{ github.workspace }}/clean_repo"
           PREPARED="${{ github.workspace }}/config/prepared.config"
           SOURCE=unknown
+          read -r -a kflags <<< "$KBUILD_FLAGS"
 
           echo "Kconfig toolchain: $(command -v clang) -> $(clang --version | head -1)"
           echo "Linker: $(command -v ld.lld) -> $(ld.lld --version | head -1)"
@@ -161,10 +156,10 @@ jobs:
           elif [[ $STATUS -eq 3 ]]; then
             echo "::warning::Q2_CONFIG_GZ_B64 is unusable, deriving the config from $DEFCONFIG + $FRAGMENT with the build toolchain."
             cd "$KERNEL_SRC"
-            make O="$KERNEL_OUT" ARCH=arm64 "$DEFCONFIG"
+            make O="$KERNEL_OUT" "${kflags[@]}" "$DEFCONFIG"
             cat "$KERNEL_SRC/$FRAGMENT" >> "$KERNEL_OUT/.config"
             "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --disable LOCALVERSION_AUTO
-            make O="$KERNEL_OUT" ARCH=arm64 LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig
+            make O="$KERNEL_OUT" "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig
             cp "$KERNEL_OUT/.config" "$PREPARED"
             SOURCE=source-defconfig
             cd "${{ github.workspace }}/clean_repo"
@@ -178,7 +173,7 @@ jobs:
           # a single byte. Any diff here is a real finding, never silenced.
           cd "$KERNEL_SRC"
           cp "$PREPARED" "$KERNEL_OUT/.config"
-          make O="$KERNEL_OUT" ARCH=arm64 LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig > /dev/null
+          make O="$KERNEL_OUT" "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig > /dev/null
           if ! cmp -s "$PREPARED" "$KERNEL_OUT/.config"; then
             echo "::error::olddefconfig is not idempotent under the build toolchain."
             diff -u "$PREPARED" "$KERNEL_OUT/.config" | tee "${{ runner.temp }}/config-diff.patch" || true
@@ -213,13 +208,10 @@ jobs:
           KERNEL_SRC="${{ steps.kernel.outputs.KERNEL_SRC }}"
           export PATH="${{ steps.clang.outputs.CLANG_BIN }}:$PATH"
 
-          build_flags=(
-            ARCH=arm64
-            LOCALVERSION="$KERNEL_LOCALVERSION"
-            KBUILD_BUILD_USER=questbuilder
-            KBUILD_BUILD_HOST=quest2-ci
-            KBUILD_BUILD_TIMESTAMP=2026-11-19T00:00:00Z
-          )
+          read -r -a kflags <<< "$KBUILD_FLAGS"
+          build_flags=("${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION"
+            KBUILD_BUILD_USER=questbuilder KBUILD_BUILD_HOST=quest2-ci
+            KBUILD_BUILD_TIMESTAMP=2026-11-19T00:00:00Z)
 
           cd "$KERNEL_SRC"
           cp "${{ github.workspace }}/config/prepared.config" "$KERNEL_OUT/.config"
@@ -276,8 +268,9 @@ jobs:
             QKX_FLAG="QKX_EXPERIMENTAL=1"
           fi
 
+          read -r -a kflags <<< "$KBUILD_FLAGS"
           make -C "$KERNEL_OUT" -j"$(nproc)" \
-            ARCH=arm64 LOCALVERSION="$KERNEL_LOCALVERSION" \
+            "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" \
             KBUILD_BUILD_USER=questbuilder KBUILD_BUILD_HOST=quest2-ci \
             KBUILD_BUILD_TIMESTAMP=2026-11-19T00:00:00Z \
             M="${{ github.workspace }}/witherblitz/module" $QKX_FLAG modules \
@@ -417,6 +410,17 @@ jobs:
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
           echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Probe artifact repositories
+        run: |
+          for u in \
+            "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk8/1.9.20/kotlin-stdlib-jdk8-1.9.20.pom" \
+            "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk8/1.9.20/kotlin-stdlib-jdk8-1.9.20.pom" \
+            "https://maven-central.storage-download.googleapis.com/maven2/org/jetbrains/kotlin/kotlin-stdlib-jdk8/1.9.20/kotlin-stdlib-jdk8-1.9.20.pom" \
+            "https://dl.google.com/dl/android/maven2/com/android/tools/build/gradle/8.5.2/gradle-8.5.2.pom" ; do
+            printf '%s -> ' "$u"
+            curl -sS -o /dev/null -w '%{http_code}\n' --max-time 30 "$u" || echo "curl-failed"
+          done
 
       - name: Assemble debug APK
         working-directory: app
