@@ -126,6 +126,8 @@ jobs:
           echo "KERNEL_VER=$KERNEL_VER" >> $GITHUB_OUTPUT
           
       - name: Prepare kernel config
+        env:
+          Q2_CONFIG_GZ_B64: ${{ secrets.Q2_CONFIG_GZ_B64 }}
         run: |
           KERNEL_SRC="${{ steps.kernel.outputs.KERNEL_SRC }}"
           KERNEL_OUT="${{ runner.temp }}/android-out"
