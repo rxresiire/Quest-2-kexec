@@ -35,6 +35,13 @@ REQUIRED_OPTIONS = {
     "CONFIG_MODVERSIONS": "y",
     "CONFIG_KALLSYMS": "y",
     "CONFIG_KALLSYMS_ALL": "y",
+    # Compiler provenance: the Quest 2 image is clang-built. A config whose
+    # capability probes came from GCC would silently drop FORTIFY_SOURCE and
+    # friends, so both are hard gates rather than warnings.
+    "CONFIG_CC_IS_CLANG": "y",
+}
+HARDENING_OPTIONS = {
+    "CONFIG_FORTIFY_SOURCE": "harden common str/mem functions against overflow",
 }
 FORBIDDEN_OPTIONS = {
     "CONFIG_KEXEC": "the stock kernel is built with kexec disabled",
@@ -77,6 +84,11 @@ def validate_config(data, *, require_digest):
                if options.get(name) != want]
     if missing:
         raise ConfigError("Configuration lacks required options: " + ", ".join(missing))
+
+    dropped = [f"{name} ({reason})" for name, reason in HARDENING_OPTIONS.items()
+               if options.get(name) != "y"]
+    if dropped:
+        raise ConfigError("Configuration lost required hardening: " + ", ".join(dropped))
 
     enabled = [name for name in FORBIDDEN_OPTIONS if options.get(name) == "y"]
     if enabled:

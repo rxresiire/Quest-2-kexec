@@ -1,4 +1,4 @@
-﻿name: Quest 2 kexec Build for cip132-st16 (Hollywood)
+name: Quest 2 kexec Build for cip132-st16 (Hollywood)
 
 on:
   push:
@@ -36,6 +36,19 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
+    # Kconfig probes the compiler (CC_IS_CLANG, CLANG_VERSION, CC_HAS_*) and
+    # hardened defaults such as FORTIFY_SOURCE are derived from those probes.
+    # The configuration stage therefore has to see exactly the toolchain the
+    # module is compiled with, otherwise olddefconfig legitimately rewrites the
+    # audited file. These values are the single source of truth for both stages.
+    env:
+      CC: clang
+      LD: ld.lld
+      HOSTCC: clang
+      HOSTCXX: clang++
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CLANG_TRIPLE: aarch64-linux-gnu-
+      KERNEL_LOCALVERSION: -g429559e91fe8
     steps:
       - name: Export workspace paths
         run: |
@@ -126,13 +139,15 @@ jobs:
           KERNEL_SRC="${{ steps.kernel.outputs.KERNEL_SRC }}"
           DEFCONFIG="${{ steps.kernel.outputs.DEFCONFIG }}"
           FRAGMENT="${{ steps.kernel.outputs.FRAGMENT }}"
-          CLANG_BIN="${{ steps.clang.outputs.CLANG_BIN }}"
           mkdir -p "$KERNEL_OUT" "${{ github.workspace }}/config"
-          export PATH="$CLANG_BIN:$PATH"
+          export PATH="${{ steps.clang.outputs.CLANG_BIN }}:$PATH"
 
           cd "${{ github.workspace }}/clean_repo"
           PREPARED="${{ github.workspace }}/config/prepared.config"
           SOURCE=unknown
+
+          echo "Kconfig toolchain: $(command -v clang) -> $(clang --version | head -1)"
+          echo "Linker: $(command -v ld.lld) -> $(ld.lld --version | head -1)"
 
           set +e
           python3 quest2_audit_cip132.py config "$PREPARED"
@@ -142,24 +157,51 @@ jobs:
           if [[ $STATUS -eq 0 ]]; then
             SOURCE=device-secret
             echo "Kernel config came from the device secret and matched the pinned digest."
+            cp "$PREPARED" "$KERNEL_OUT/.config"
           elif [[ $STATUS -eq 3 ]]; then
-            echo "::warning::Q2_CONFIG_GZ_B64 is unusable, deriving the config from $DEFCONFIG + $FRAGMENT."
+            echo "::warning::Q2_CONFIG_GZ_B64 is unusable, deriving the config from $DEFCONFIG + $FRAGMENT with the build toolchain."
             cd "$KERNEL_SRC"
             make O="$KERNEL_OUT" ARCH=arm64 "$DEFCONFIG"
             cat "$KERNEL_SRC/$FRAGMENT" >> "$KERNEL_OUT/.config"
             "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --disable LOCALVERSION_AUTO
-            make O="$KERNEL_OUT" ARCH=arm64 olddefconfig
+            make O="$KERNEL_OUT" ARCH=arm64 LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig
             cp "$KERNEL_OUT/.config" "$PREPARED"
+            SOURCE=source-defconfig
             cd "${{ github.workspace }}/clean_repo"
             python3 quest2_audit_cip132.py config "$PREPARED" --from-file "$PREPARED"
-            SOURCE=source-defconfig
           else
             echo "::error::Config gate rejected the supplied secret; refusing to substitute silently."
             exit 1
           fi
 
+          # Determinism gate: regenerating with the same toolchain must not change
+          # a single byte. Any diff here is a real finding, never silenced.
+          cd "$KERNEL_SRC"
           cp "$PREPARED" "$KERNEL_OUT/.config"
-          grep -E "CONFIG_KEXEC|CONFIG_MODULES=|CONFIG_MODULE_SIG|CONFIG_KALLSYMS_ALL" "$PREPARED" || true
+          make O="$KERNEL_OUT" ARCH=arm64 LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig > /dev/null
+          if ! cmp -s "$PREPARED" "$KERNEL_OUT/.config"; then
+            echo "::error::olddefconfig is not idempotent under the build toolchain."
+            diff -u "$PREPARED" "$KERNEL_OUT/.config" | tee "${{ runner.temp }}/config-diff.patch" || true
+            echo "Differing options:"
+            diff <(grep -E '^(# )?CONFIG_' "$PREPARED" | sort) \
+                 <(grep -E '^(# )?CONFIG_' "$KERNEL_OUT/.config" | sort) | sed -E 's/^/  /' || true
+            exit 1
+          fi
+          echo "olddefconfig is idempotent under clang; the prepared config is the audited config."
+
+          # The recorded CLANG_VERSION must describe the compiler that will build
+          # the modules, otherwise the capability probes in the config are stale.
+          CLANG_TRIPLE_VERSION=$(clang --version | head -1 | sed -E 's/.*version ([0-9]+)\.([0-9]+)\.([0-9]+).*/\1 \2 \3/')
+          read -r MAJOR MINOR PATCH <<< "$CLANG_TRIPLE_VERSION"
+          EXPECTED_CLANG_VERSION=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          CONFIG_CLANG_VERSION=$(grep -E '^CONFIG_CLANG_VERSION=' "$PREPARED" | cut -d= -f2)
+          if [[ "$CONFIG_CLANG_VERSION" != "$EXPECTED_CLANG_VERSION" ]]; then
+            echo "::error::CONFIG_CLANG_VERSION=$CONFIG_CLANG_VERSION does not match clang $MAJOR.$MINOR.$PATCH ($EXPECTED_CLANG_VERSION)"
+            exit 1
+          fi
+          echo "CONFIG_CLANG_VERSION=$CONFIG_CLANG_VERSION matches the build compiler."
+
+          grep -E "CONFIG_CC_IS_CLANG|CONFIG_FORTIFY_SOURCE|CONFIG_KASAN|CONFIG_SHADOW_CALL_STACK|CONFIG_CFI_CLANG|CONFIG_LTO|CONFIG_KEXEC|CONFIG_MODULES=|CONFIG_MODVERSIONS|CONFIG_KALLSYMS_ALL" "$PREPARED"
 
           CONFIG_SHA=$(sha256sum "$PREPARED" | cut -d' ' -f1)
           echo "CONFIG_SHA=$CONFIG_SHA" >> "$GITHUB_OUTPUT"
@@ -169,33 +211,34 @@ jobs:
         id: build
         run: |
           KERNEL_SRC="${{ steps.kernel.outputs.KERNEL_SRC }}"
-          CLANG_BIN="${{ steps.clang.outputs.CLANG_BIN }}"
-          export PATH="$CLANG_BIN:$PATH"
+          export PATH="${{ steps.clang.outputs.CLANG_BIN }}:$PATH"
 
-          flags=(
-            ARCH=arm64 CC=clang LD=ld.lld HOSTCC=clang HOSTCXX=clang++ \
-            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-
-            LOCALVERSION=-g429559e91fe8
-            KBUILD_BUILD_USER=questbuilder KBUILD_BUILD_HOST=quest2-ci
-            KBUILD_BUILD_TIMESTAMP="2026-11-19T00:00:00Z"
+          build_flags=(
+            ARCH=arm64
+            LOCALVERSION="$KERNEL_LOCALVERSION"
+            KBUILD_BUILD_USER=questbuilder
+            KBUILD_BUILD_HOST=quest2-ci
+            KBUILD_BUILD_TIMESTAMP=2026-11-19T00:00:00Z
           )
 
           cd "$KERNEL_SRC"
-          make O="$KERNEL_OUT" "${flags[@]}" olddefconfig
+          cp "${{ github.workspace }}/config/prepared.config" "$KERNEL_OUT/.config"
+          make O="$KERNEL_OUT" "${build_flags[@]}" olddefconfig
 
           if ! cmp -s "${{ github.workspace }}/config/prepared.config" "$KERNEL_OUT/.config"; then
-            echo "::error::olddefconfig rewrote the audited config; the configuration does not match this kernel tree."
+            echo "::error::olddefconfig rewrote the audited config; the configuration does not match the build toolchain."
             diff -u "${{ github.workspace }}/config/prepared.config" "$KERNEL_OUT/.config" | head -200 || true
             exit 1
           fi
-          echo "Config accepted unchanged by olddefconfig."
+          echo "Audited config accepted unchanged by olddefconfig."
 
-          make O="$KERNEL_OUT" -j"$(nproc)" "${flags[@]}" Image modules 2>&1 | tee "${{ runner.temp }}/kernel-build.log"
+          make O="$KERNEL_OUT" -j"$(nproc)" "${build_flags[@]}" Image modules 2>&1 | tee "${{ runner.temp }}/kernel-build.log"
 
           BUILT_VER=$(cat "$KERNEL_OUT/include/config/kernel.release")
           echo "Built kernel version: $BUILT_VER"
           echo "BUILT_VER=$BUILT_VER" >> "$GITHUB_OUTPUT"
 
+          cp "$KERNEL_OUT/Module.symvers" "${{ runner.temp }}/Module.symvers"
           cp "$KERNEL_OUT/Module.symvers" "${{ runner.temp }}/Module.symvers"
 
           cat > "${{ runner.temp }}/generate_crcs.py" << 'PYEOF'
@@ -224,8 +267,7 @@ jobs:
 
       - name: Build quest_kexec module
         run: |
-          CLANG_BIN="${{ steps.clang.outputs.CLANG_BIN }}"
-          export PATH="$CLANG_BIN:$PATH"
+          export PATH="${{ steps.clang.outputs.CLANG_BIN }}:$PATH"
           mkdir -p "$MODULE_DIR"
 
           cd "${{ github.workspace }}/witherblitz/module"
@@ -235,10 +277,9 @@ jobs:
           fi
 
           make -C "$KERNEL_OUT" -j"$(nproc)" \
-            ARCH=arm64 CC=clang LD=ld.lld HOSTCC=clang CROSS_COMPILE=aarch64-linux-gnu- \
-            CLANG_TRIPLE=aarch64-linux-gnu- LOCALVERSION=-g429559e91fe8 \
+            ARCH=arm64 LOCALVERSION="$KERNEL_LOCALVERSION" \
             KBUILD_BUILD_USER=questbuilder KBUILD_BUILD_HOST=quest2-ci \
-            KBUILD_BUILD_TIMESTAMP="2026-11-19T00:00:00Z" \
+            KBUILD_BUILD_TIMESTAMP=2026-11-19T00:00:00Z \
             M="${{ github.workspace }}/witherblitz/module" $QKX_FLAG modules \
             2>&1 | tee "${{ runner.temp }}/loader-build.log"
 
