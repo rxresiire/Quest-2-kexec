@@ -87,10 +87,12 @@ jobs:
             jq cpio
 
       - name: Restore clang-r450784e toolchain
-        uses: actions/cache@v4
+        id: clangcache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/clang-r450784e
           key: clang-r450784e-425c8149f17c8d9914bf690b4d5abe45a13fb993
+
 
       - name: Fetch clang-r450784e (Android toolchain)
         id: clang
@@ -121,6 +123,12 @@ jobs:
           echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_OUTPUT"
           echo "CLANG_BIN=$CLANG_DIR/bin" >> "$GITHUB_OUTPUT"
 
+      - name: Save clang-r450784e toolchain
+        if: always() && steps.clangcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/clang-r450784e
+          key: clang-r450784e-425c8149f17c8d9914bf690b4d5abe45a13fb993
       - name: Setup kernel source
         id: kernel
         run: |
@@ -252,7 +260,7 @@ jobs:
 
       - name: Restore kernel build output
         id: kernelcache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/android-out
           key: kout-${{ steps.kernel.outputs.KERNEL_HEAD }}-${{ steps.config.outputs.CONFIG_SHA }}-llvm-r450784e
@@ -301,7 +309,8 @@ jobs:
               for line in handle:
                   parts = line.split()
                   if len(parts) >= 3:
-                      symbols[parts[1]] = '0x' + parts[0]
+                      crc = parts[0]
+                      symbols[parts[1]] = crc if crc.startswith('0x') else '0x' + crc
           with open(os.environ['OUTPUT_JSON'], 'w') as handle:
               json.dump({
                   'schema_version': 1,
@@ -315,6 +324,13 @@ jobs:
           OUTPUT_JSON="${{ runner.temp }}/stock_crcs_cip132.json" \
           BUILT_VER="$BUILT_VER" TARGET_BUILD="$TARGET_BUILD" \
             python3 "${{ runner.temp }}/generate_crcs.py"
+
+      - name: Save kernel build output
+        if: always() && steps.kernelcache.outputs.cache-hit != 'true' && steps.build.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/android-out
+          key: kout-${{ steps.kernel.outputs.KERNEL_HEAD }}-${{ steps.config.outputs.CONFIG_SHA }}-llvm-r450784e
 
       - name: Build quest_kexec module
         run: |
