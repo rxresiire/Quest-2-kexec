@@ -440,6 +440,12 @@ jobs:
           ARTIFACT_DIR="${{ runner.temp }}/artifacts"
           mkdir -p "$ARTIFACT_DIR"
           cp "$MODULE_DIR"/*.ko "$ARTIFACT_DIR/"
+          if [[ -s "$KERNEL_OUT/arch/arm64/boot/Image" ]]; then
+            cp "$KERNEL_OUT/arch/arm64/boot/Image" "$ARTIFACT_DIR/Image"
+          else
+            echo "::error::kernel Image missing from the build output"
+            exit 1
+          fi
           cp "$MODULE_DIR"/*.cmd "$ARTIFACT_DIR/" 2>/dev/null || true
           cp "${{ runner.temp }}/Module.symvers" "$ARTIFACT_DIR/"
           cp "${{ runner.temp }}/build-provenance.json" "$ARTIFACT_DIR/"
@@ -515,5 +521,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rxresiire-kexec-installer-apk-${{ github.run_id }}
-          path: app/build/outputs/apk/**/*.apk
+          path: app/installer/build/outputs/apk/**/*.apk
           retention-days: 30
