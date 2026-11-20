@@ -14,6 +14,11 @@ on:
         description: 'Target incremental build number (e.g., 52322490022300150)'
         type: string
         default: '52322490022300150'
+      module_source:
+        description: 'Module sources: witherblitz (staging-only) or q2fork (Quest 2 port, jump enabled)'
+        type: choice
+        options: [witherblitz, q2fork]
+        default: witherblitz
       experimental:
         description: 'Enable QKX_EXPERIMENTAL=1 for hardware transition code (DANGEROUS)'
         type: boolean
@@ -50,33 +55,46 @@ jobs:
           # compiles the module, so every stage expands the same array.
           echo "KBUILD_FLAGS=ARCH=arm64 CC=clang LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
 
-      - name: Checkout WitherBlitz Quest 2 SteamOS Dual-Boot
+      # Kernel patching material always comes from the WitherBlitz tree; the
+      # module sources are checked out separately because they are selectable.
+      - name: Checkout WitherBlitz kernel patches
         uses: actions/checkout@v4
         with:
           repository: WitherBlitz/Quest-2-Steam-OS-Dual-Boot
           persist-credentials: false
           path: witherblitz
 
+      - name: Checkout module sources
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.module_source == 'q2fork' && 'machachu56/quest-kexec-q2' || 'WitherBlitz/Quest-2-Steam-OS-Dual-Boot' }}
+          persist-credentials: false
+          path: modulesrc
+
       - name: Checkout our modifications
         uses: actions/checkout@v4
         with:
           path: clean_repo
 
-      # The module sources are used exactly as the upstream project ships them.
-      # Our earlier local fork (loader.c + shutdown_backends.c) does not compile
-      # against this tree: it calls qkx_test_transition before declaring it and
-      # includes <linux/soc/qcom/scm.h>, which this kernel does not provide.
-      - name: Verify module sources are upstream
+      # witherblitz ships the upstream staging-only module; q2fork is the Quest 2
+      # port of the same loader. It compiles the jump path unconditionally and has
+      # no Hollywood DMA gate, which the audit records as an experimental artifact.
+      - name: Verify module sources
         run: |
-          cd "${{ github.workspace }}/witherblitz/module"
-          test -f loader.c && test -f transition.S && test -f shutdown.c
-          test -f shutdown_io.c && test -f Makefile
-          grep -q 'quest_kexec-y := loader.o transition.o shutdown.o shutdown_io.o' Makefile
+          cd "${{ github.workspace }}/modulesrc/module"
+          test -f loader.c && test -f transition.S && test -f Makefile
+          if [[ "${{ inputs.module_source }}" == "q2fork" ]]; then
+            grep -q 'quest_kexec-y := loader.o transition.o' Makefile
+            echo "Module sources are the quest-kexec-q2 Quest 2 port."
+          else
+            test -f shutdown.c && test -f shutdown_io.c
+            grep -q 'quest_kexec-y := loader.o transition.o shutdown.o shutdown_io.o' Makefile
+            echo "Module sources are the upstream staging-only build."
+          fi
           if grep -rq 'shutdown_backends' .; then
             echo "::error::stale loader fork detected in module sources"
             exit 1
           fi
-          echo "Module sources are the upstream staging-only build."
 
       - name: Install build dependencies
         run: |
@@ -362,12 +380,12 @@ jobs:
           export PATH="${{ steps.clang.outputs.CLANG_BIN }}:$PATH"
           mkdir -p "$MODULE_DIR"
 
-          cd "${{ github.workspace }}/witherblitz/module"
+          cd "${{ github.workspace }}/modulesrc/module"
           QKX_FLAG=""
-          if [[ "${{ inputs.experimental }}" == "true" ]]; then
+          # q2fork's Makefile enables the jump unconditionally; the witheblitz
+          # sources need the explicit flag. Both record it in the provenance.
+          if [[ "${{ inputs.experimental }}" == "true" || "${{ inputs.module_source }}" == "q2fork" ]]; then
             QKX_FLAG="QKX_EXPERIMENTAL=1"
-            # Recorded in the provenance and audit manifest: this artifact carries
-            # the board shutdown/handoff path and must not be treated as stage-only.
             echo "QKX_EXPERIMENTAL=1" >> "$GITHUB_ENV"
           fi
 
@@ -376,11 +394,11 @@ jobs:
             "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" \
             KBUILD_BUILD_USER=questbuilder KBUILD_BUILD_HOST=quest2-ci \
             KBUILD_BUILD_TIMESTAMP=2026-11-19T00:00:00Z \
-            M="${{ github.workspace }}/witherblitz/module" $QKX_FLAG modules \
+            M="${{ github.workspace }}/modulesrc/module" $QKX_FLAG modules \
             2>&1 | tee "${{ runner.temp }}/loader-build.log"
 
-          cp quest_kexec.ko marker_read.ko usb_log.ko camera_dsp_diag.ko "$MODULE_DIR/"
-          cp .loader.o.cmd .transition.o.cmd .shutdown.o.cmd .shutdown_io.o.cmd "$MODULE_DIR/" 2>/dev/null || true
+          cp *.ko "$MODULE_DIR/"
+          cp *.cmd "$MODULE_DIR/" 2>/dev/null || true
 
       - name: Align module_layout to the device
         run: |
@@ -405,7 +423,7 @@ jobs:
         run: |
           cd "${{ github.workspace }}/clean_repo"
           AUDIT_FLAGS=""
-          if [[ "${{ inputs.experimental }}" == "true" ]]; then
+          if [[ "${{ inputs.experimental }}" == "true" || "${{ inputs.module_source }}" == "q2fork" ]]; then
             AUDIT_FLAGS="--allow-experimental-jump"
           fi
           python3 quest2_audit_cip132.py modules \
@@ -416,8 +434,7 @@ jobs:
             --loader-command "$MODULE_DIR/.loader.o.cmd" \
             $AUDIT_FLAGS \
             --output "${{ runner.temp }}/audit-manifest.json" \
-            "$MODULE_DIR"/quest_kexec.ko "$MODULE_DIR"/marker_read.ko \
-            "$MODULE_DIR"/usb_log.ko "$MODULE_DIR"/camera_dsp_diag.ko
+            "$MODULE_DIR"/*.ko
           cat "${{ runner.temp }}/audit-manifest.json"
 
       - name: Generate build provenance
@@ -453,8 +470,8 @@ jobs:
 
           kernel_out = os.environ['KERNEL_OUT']
           provenance = {
-              "source_repo": "WitherBlitz/Quest-2-Steam-OS-Dual-Boot",
-              "source_commit": git_rev(os.path.join(os.environ['GITHUB_WORKSPACE'], "witherblitz")),
+              "source_repo": os.environ['MODULE_SOURCE_REPO'],
+              "source_commit": git_rev(os.path.join(os.environ['GITHUB_WORKSPACE'], "modulesrc")),
               "kernel_repo": os.environ['KERNEL_SOURCE'],
               "kernel_commit": git_rev(os.environ['KERNEL_SRC']),
               "target_build": os.environ['TARGET_BUILD'],
@@ -476,6 +493,7 @@ jobs:
           KERNEL_SOURCE="$KERNEL_SOURCE" TARGET_BUILD="$TARGET_BUILD" \
           CONFIG_SOURCE="${{ steps.config.outputs.CONFIG_SOURCE }}" \
           QKX_EXPERIMENTAL="$QKX_EXPERIMENTAL" \
+          MODULE_SOURCE_REPO="${{ inputs.module_source == 'q2fork' && 'machachu56/quest-kexec-q2' || 'WitherBlitz/Quest-2-Steam-OS-Dual-Boot' }}" \
           GITHUB_WORKSPACE="${{ github.workspace }}" MODULE_DIR="$MODULE_DIR" \
           RUNNER_TEMP="${{ runner.temp }}" \
             python3 "${{ runner.temp }}/generate_provenance.py"
