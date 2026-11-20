@@ -398,7 +398,8 @@ jobs:
             2>&1 | tee "${{ runner.temp }}/loader-build.log"
 
           cp *.ko "$MODULE_DIR/"
-          cp *.cmd "$MODULE_DIR/" 2>/dev/null || true
+          # .loader.o.cmd is a dotfile, so a shell glob would miss it.
+          find . -maxdepth 1 -name '*.cmd' -exec cp {} "$MODULE_DIR/" \;
 
       - name: Align module_layout to the device
         run: |
