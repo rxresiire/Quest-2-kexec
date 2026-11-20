@@ -209,6 +209,24 @@ jobs:
             SOURCE=device-secret
             echo "Kernel config came from the device secret and matched the pinned digest."
             cp "$PREPARED" "$KERNEL_OUT/.config"
+          elif [[ -f "${{ github.workspace }}/clean_repo/config/q2-stock.config" ]]; then
+            # The headset's own /proc/config.gz (firmware 52322490022300150) is the
+            # authoritative configuration: struct layout probes such as
+            # module_layout's CRC follow from it, so this is what the module must be
+            # built against. It is committed as config/q2-stock.config.
+            echo "Using the device's own /proc/config.gz (config/q2-stock.config)."
+            cp "${{ github.workspace }}/clean_repo/config/q2-stock.config" "$KERNEL_OUT/.config"
+            # LOCALVERSION_AUTO would append this clone's commit hash on top of the
+            # device's own -g suffix; disabling it keeps vermagic byte-identical to
+            # the headset. It affects only the version string, never struct layout,
+            # so no CRC moves.
+            "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --disable LOCALVERSION_AUTO
+            cd "$KERNEL_SRC"
+            make O="$KERNEL_OUT" "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig
+            cp "$KERNEL_OUT/.config" "$PREPARED"
+            SOURCE=device-config
+            cd "${{ github.workspace }}/clean_repo"
+            python3 quest2_audit_cip132.py config "$PREPARED" --from-file "$PREPARED"
           elif [[ $STATUS -eq 3 ]]; then
             echo "::warning::Q2_CONFIG_GZ_B64 is unusable, deriving the config from $DEFCONFIG + $FRAGMENT with the build toolchain."
             cd "$KERNEL_SRC"
@@ -364,12 +382,12 @@ jobs:
 
       - name: Audit modules (cip132-st16)
         run: |
-          cp "${{ runner.temp }}/stock_crcs_cip132.json" "${{ github.workspace }}/clean_repo/quest2_stock_crcs_cip132.json"
           cd "${{ github.workspace }}/clean_repo"
           python3 quest2_audit_cip132.py modules \
             --symvers "$KERNEL_OUT/Module.symvers" \
             --config "$KERNEL_OUT/.config" \
             --config-sha "${{ steps.config.outputs.CONFIG_SHA }}" \
+            --stock-crcs config/q2-device-crcs.json \
             --loader-command "$MODULE_DIR/.loader.o.cmd" \
             --output "${{ runner.temp }}/audit-manifest.json" \
             "$MODULE_DIR"/quest_kexec.ko "$MODULE_DIR"/marker_read.ko \

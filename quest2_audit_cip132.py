@@ -25,7 +25,7 @@ from pathlib import Path
 import struct
 import sys
 
-CONFIG_SHA = "87e00f44625e573a199fefc9824acd20b722306288e3d12b3fda2a0464246cd9"
+CONFIG_SHA = "5d881a27f346f827b4b3882ca26ad373e9d86ddfa334001fe0fcdf0b6feb7c17"
 VERMAGIC = "4.19.325-cip132-st16-g429559e91fe8 SMP preempt mod_unload modversions aarch64"
 
 REQUIRED_OPTIONS = {
@@ -219,13 +219,23 @@ def inspect_module(data, generated, stock, *, expected_vermagic=VERMAGIC):
         name = cstring(versions[offset+8:offset+64], 0)
         if not name or name in rows:
             raise ValueError("Empty or duplicate module version record")
-        if generated.get(name) != crc or stock.get(name) != crc:
-            raise ValueError("Missing or mismatching generated/stock CRC: " + name)
+        if generated.get(name) != crc:
+            raise ValueError("Missing or mismatching generated CRC: " + name)
+        # The device reference covers only symbols that some stock vendor module
+        # also imports, so it is a cross-check wherever it overlaps; every module
+        # always imports module_layout, which makes it a mandatory anchor.
+        if name in stock and stock[name] != crc:
+            raise ValueError(
+                f"Device CRC mismatch for {name}: module has 0x{crc:08x}, stock kernel has 0x{stock[name]:08x}")
         rows[name] = f"0x{crc:08x}"
     if "module_layout" not in rows or not undefined <= rows.keys():
         raise ValueError("Undefined symbol lacks a version record or module_layout is missing")
+    if "module_layout" not in stock:
+        raise ValueError("Device CRC reference lacks module_layout; refusing to audit without it")
     result = {"elf": "ELF64 LE REL AArch64", "vermagic": magic[0],
               "undefined_symbols": sorted(undefined), "versioned_imports": len(rows),
+              "device_cross_checked": sum(1 for name in rows if name in stock),
+              "module_layout_crc": rows.get("module_layout"),
               "crc_rows": rows}
     if b"parmtype=ram_diagnose:bool" in info.split(b"\0"):
         indirect = {}
@@ -284,12 +294,13 @@ def cmd_modules(args):
     if "-DQKX_ENABLE_EXPERIMENTAL_JUMP" in command:
         raise ValueError("Experimental jump was enabled in the effective compile command")
     stock_path = Path(args.stock_crcs or Path(__file__).with_name("quest2_stock_crcs_cip132.json"))
-    stock = json.loads(stock_path.read_text())
-    stock = {key: int(value, 16) for key, value in stock["symbols"].items()}
+    stock_doc = json.loads(stock_path.read_text())
+    provenance = stock_doc.get("provenance", "unknown")
+    stock = {key: int(value, 16) for key, value in stock_doc["symbols"].items()}
     generated = load_symvers(args.symvers)
     manifest = {"schema_version": 1, "config_sha256": config_hash,
                 "stage_only": True, "hardware_handoff": "unproven",
-                "stock_crc_provenance": stock.get("provenance", "unknown"), "modules": []}
+                "stock_crc_provenance": provenance, "modules": []}
     for path in args.modules:
         data = path.read_bytes()
         result = inspect_module(data, generated, stock)
