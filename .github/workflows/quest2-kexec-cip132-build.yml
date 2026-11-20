@@ -144,6 +144,7 @@ jobs:
             DEFCONFIG=vendor/oculus_kona_defconfig
           fi
 
+          echo "KERNEL_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "KERNEL_SRC=$KERNEL_SRC" >> "$GITHUB_OUTPUT"
           echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_OUTPUT"
           echo "FRAGMENT=arch/arm64/configs/vendor/oculus_hollywood_defconfig" >> "$GITHUB_OUTPUT"
@@ -227,6 +228,13 @@ jobs:
           echo "CONFIG_SHA=$CONFIG_SHA" >> "$GITHUB_OUTPUT"
           echo "CONFIG_SOURCE=$SOURCE" >> "$GITHUB_OUTPUT"
 
+      - name: Restore kernel build output
+        id: kernelcache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/android-out
+          key: kout-${{ steps.kernel.outputs.KERNEL_HEAD }}-${{ steps.config.outputs.CONFIG_SHA }}-llvm-r450784e
+
       - name: Build kernel
         id: build
         run: |
@@ -249,7 +257,12 @@ jobs:
           fi
           echo "Audited config accepted unchanged by olddefconfig."
 
-          make O="$KERNEL_OUT" -j"$(nproc)" "${build_flags[@]}" Image modules 2>&1 | tee "${{ runner.temp }}/kernel-build.log"
+          if [[ -s "$KERNEL_OUT/Module.symvers" && -s "$KERNEL_OUT/arch/arm64/boot/Image" ]]; then
+            echo "Reusing cached kernel output: $(cat "$KERNEL_OUT/include/config/kernel.release")"
+            echo "::notice::Kernel objects restored from cache; no recompile needed."
+          else
+            make O="$KERNEL_OUT" -j"$(nproc)" "${build_flags[@]}" Image modules 2>&1 | tee "${{ runner.temp }}/kernel-build.log"
+          fi
 
           BUILT_VER=$(cat "$KERNEL_OUT/include/config/kernel.release")
           echo "Built kernel version: $BUILT_VER"
@@ -319,7 +332,7 @@ jobs:
             --symvers "$KERNEL_OUT/Module.symvers" \
             --config "$KERNEL_OUT/.config" \
             --config-sha "${{ steps.config.outputs.CONFIG_SHA }}" \
-            --loader-command "${{ github.workspace }}/witherblitz/module/Makefile" \
+            --loader-command "$MODULE_DIR/.loader.o.cmd" \
             --output "${{ runner.temp }}/audit-manifest.json" \
             "$MODULE_DIR"/quest_kexec.ko "$MODULE_DIR"/marker_read.ko \
             "$MODULE_DIR"/usb_log.ko "$MODULE_DIR"/camera_dsp_diag.ko
