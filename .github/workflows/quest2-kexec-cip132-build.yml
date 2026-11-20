@@ -143,9 +143,16 @@ jobs:
             KERNEL_SRC="$WORK_DIR/android/kernel/qcom/kona"
             mkdir -p "$(dirname "$KERNEL_SRC")"
             if [[ ! -d "$KERNEL_SRC/.git" ]]; then
-              git clone --depth 50 --branch oculus-quest2-kernel-master \
+              git clone --depth 100 --branch oculus-quest2-kernel-master \
                 https://github.com/facebookincubator/oculus-linux-kernel.git "$KERNEL_SRC"
             fi
+            # Build the exact tree the headset runs. Commit 9c58c012f35d is
+            # "Oculus Quest 2 kernel project build: 5232249.2230.150", which is
+            # firmware 52322490022300150 - the build id reported by the device.
+            # Building branch head instead drifts genksyms CRCs for symbols such as
+            # filp_open/__free_pages and the kernel then rejects the module.
+            git -C "$KERNEL_SRC" fetch --depth 100 origin 9c58c012f35d 2>/dev/null || true
+            git -C "$KERNEL_SRC" checkout --detach 9c58c012f35d
             cd "$KERNEL_SRC"
             # Refuse to spend an hour compiling a tree whose vendor headers are
             # already broken: every dangling symlink is listed before the build.
