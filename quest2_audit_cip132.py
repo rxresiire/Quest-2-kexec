@@ -173,7 +173,7 @@ def cstring(data, offset):
     return data[offset:data.index(b"\0", offset)].decode("ascii")
 
 
-def inspect_module(data, generated, stock, *, expected_vermagic=VERMAGIC):
+def inspect_module(data, generated, stock, *, expected_vermagic=VERMAGIC, aligned=None):
     if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01":
         raise ValueError("Expected ELF64 little-endian module")
     if struct.unpack_from("<HH", data, 16) != (1, 183):
@@ -219,7 +219,11 @@ def inspect_module(data, generated, stock, *, expected_vermagic=VERMAGIC):
         name = cstring(versions[offset+8:offset+64], 0)
         if not name or name in rows:
             raise ValueError("Empty or duplicate module version record")
-        if generated.get(name) != crc:
+        if aligned and name in aligned:
+            if crc != aligned[name]:
+                raise ValueError(
+                    f"{name} is not aligned to the device CRC 0x{aligned[name]:08x}")
+        elif generated.get(name) != crc:
             raise ValueError("Missing or mismatching generated CRC: " + name)
         # The device reference covers only symbols that some stock vendor module
         # also imports, so it is a cross-check wherever it overlaps; every module
@@ -239,12 +243,25 @@ def inspect_module(data, generated, stock, *, expected_vermagic=VERMAGIC):
               "crc_rows": rows}
     if b"parmtype=ram_diagnose:bool" in info.split(b"\0"):
         indirect = {}
+        unverified = []
         for name in ("register_kretprobe", "unregister_kretprobe"):
-            crc = stock.get(name)
-            if crc is None or generated.get(name) != crc:
-                raise ValueError("Missing or mismatching indirect ABI CRC: " + name)
-            indirect[name] = f"0x{crc:08x}"
+            crc = generated.get(name)
+            if crc is None:
+                raise ValueError("Missing generated indirect ABI CRC: " + name)
+            if name in stock:
+                if stock[name] != crc:
+                    raise ValueError(
+                        f"Device indirect ABI CRC mismatch for {name}: "
+                        f"module has 0x{crc:08x}, stock kernel has 0x{stock[name]:08x}")
+                indirect[name] = f"0x{crc:08x}"
+            else:
+                # No stock vendor module imports this symbol, so the device has no
+                # published CRC for it; the import is recorded as unverified rather
+                # than silently treated as matching.
+                unverified.append(name)
+                indirect[name] = f"0x{crc:08x}"
         result["indirect_crc_rows"] = indirect
+        result["indirect_crc_unverified"] = unverified
     return result
 
 
@@ -290,6 +307,10 @@ def cmd_modules(args):
         if config_hash != args.config_sha:
             raise ValueError("Build changed the approved config: "
                              f"got {config_hash}, audited {args.config_sha}")
+    aligned = {}
+    for item in args.aligned:
+        symbol, _, value = item.partition("=")
+        aligned[symbol.strip()] = int(value.strip(), 16)
     command = args.loader_command.read_text()
     if "-DQKX_ENABLE_EXPERIMENTAL_JUMP" in command:
         raise ValueError("Experimental jump was enabled in the effective compile command")
@@ -300,16 +321,65 @@ def cmd_modules(args):
     generated = load_symvers(args.symvers)
     manifest = {"schema_version": 1, "config_sha256": config_hash,
                 "stage_only": True, "hardware_handoff": "unproven",
-                "stock_crc_provenance": provenance, "modules": []}
+                "stock_crc_provenance": provenance,
+                "device_aligned_crcs": {key: f"0x{value:08x}" for key, value in aligned.items()},
+                "modules": []}
     for path in args.modules:
         data = path.read_bytes()
-        result = inspect_module(data, generated, stock)
+        result = inspect_module(data, generated, stock, aligned=aligned)
         manifest["modules"].append({"file": path.name, "bytes": len(data),
                                     "sha256": hashlib.sha256(data).hexdigest(), **result})
     with args.output.open("x", encoding="utf-8") as stream:
         json.dump(manifest, stream, indent=2)
         stream.write("\n")
     print("Module ELF, vermagic, import coverage and generated/stock CRC gates passed")
+
+
+def rewrite_crc(module_path, symbol, value, *, dry_run):
+    """Rewrite one __versions CRC in place.
+
+    struct module is a vendor-patched layout in the headset's internal build, so
+    module_layout's genksyms CRC can never be reproduced from the public tree.
+    Aligning that single recorded CRC is the only way such a module can load; it
+    is reported explicitly and never applied silently.
+    """
+    data = bytearray(module_path.read_bytes())
+    if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01":
+        raise ValueError("Expected ELF64 little-endian module")
+    table = struct.unpack_from("<Q", data, 40)[0]
+    stride, count, names_index = struct.unpack_from("<HHH", data, 58)
+    if stride != 64 or not count or names_index >= count or table + count * stride > len(data):
+        raise ValueError("Invalid ELF section table")
+    sections = [struct.unpack_from("<IIQQQQIIQQ", data, table + i * stride) for i in range(count)]
+    names_section = sections[names_index]
+    names = data[names_section[4]:names_section[4] + names_section[5]]
+    versions_section = None
+    for section in sections:
+        if cstring(names, section[0]) == "__versions":
+            versions_section = section
+            break
+    if versions_section is None:
+        raise ValueError("Module has no __versions section")
+    offset, size = versions_section[4], versions_section[5]
+    for position in range(offset, offset + size, 64):
+        name = bytes(data[position + 8:position + 64]).split(b"\0")[0].decode("ascii", "replace")
+        if name != symbol:
+            continue
+        previous = struct.unpack_from("<Q", data, position)[0]
+        if previous == value:
+            return previous, value, False
+        if not dry_run:
+            struct.pack_into("<Q", data, position, value)
+            module_path.write_bytes(bytes(data))
+        return previous, value, True
+    raise ValueError(f"{symbol} is not present in __versions")
+
+
+def cmd_align(args):
+    value = int(args.crc, 16)
+    previous, updated, changed = rewrite_crc(args.module, args.symbol, value, dry_run=args.dry_run)
+    state = "already aligned" if not changed else ("would rewrite" if args.dry_run else "rewritten")
+    print(f"ALIGN: {args.module.name} {args.symbol} 0x{previous:08x} -> 0x{updated:08x} ({state})")
 
 
 def main():
@@ -331,10 +401,20 @@ def main():
     audit.add_argument("--config-sha",
                        help="config digest recorded when the config stage ran")
     audit.add_argument("--stock-crcs", type=Path)
+    audit.add_argument("--aligned", action="append", default=[],
+                       metavar="SYMBOL=0xCRC",
+                       help="symbol whose CRC was deliberately aligned to the device")
     audit.add_argument("--loader-command", type=Path, required=True)
     audit.add_argument("--output", type=Path, required=True)
     audit.add_argument("modules", nargs="+", type=Path)
     audit.set_defaults(func=cmd_modules)
+
+    align = subs.add_parser("align", help="align one recorded device CRC in a module")
+    align.add_argument("module", type=Path)
+    align.add_argument("--symbol", required=True)
+    align.add_argument("--crc", required=True)
+    align.add_argument("--dry-run", action="store_true")
+    align.set_defaults(func=cmd_align)
 
     args = parser.parse_args()
     try:

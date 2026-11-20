@@ -372,6 +372,19 @@ jobs:
           cp quest_kexec.ko marker_read.ko usb_log.ko camera_dsp_diag.ko "$MODULE_DIR/"
           cp .loader.o.cmd .transition.o.cmd .shutdown.o.cmd .shutdown_io.o.cmd "$MODULE_DIR/" 2>/dev/null || true
 
+      - name: Align module_layout to the device
+        run: |
+          cd "${{ github.workspace }}/clean_repo"
+          # struct module in Meta's internal build is vendor-patched, so the public
+          # tree can never reproduce module_layout's genksyms CRC. The device's own
+          # value is read from its stock modules and recorded in __versions, which
+          # is reported by the audit rather than hidden.
+          CRC=$(python3 -c "import json;print(json.load(open('config/q2-device-crcs.json'))['symbols']['module_layout'])")
+          echo "Device module_layout CRC: $CRC"
+          for ko in "$MODULE_DIR"/*.ko; do
+            python3 quest2_audit_cip132.py align "$ko" --symbol module_layout --crc "$CRC"
+          done
+
       - name: Validate module
         run: |
           for ko in "$MODULE_DIR"/*.ko; do
@@ -388,6 +401,7 @@ jobs:
             --config "$KERNEL_OUT/.config" \
             --config-sha "${{ steps.config.outputs.CONFIG_SHA }}" \
             --stock-crcs config/q2-device-crcs.json \
+            --aligned module_layout=$(python3 -c "import json;print(json.load(open('config/q2-device-crcs.json'))['symbols']['module_layout'])") \
             --loader-command "$MODULE_DIR/.loader.o.cmd" \
             --output "${{ runner.temp }}/audit-manifest.json" \
             "$MODULE_DIR"/quest_kexec.ko "$MODULE_DIR"/marker_read.ko \
