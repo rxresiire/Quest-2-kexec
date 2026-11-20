@@ -219,18 +219,23 @@ def inspect_module(data, generated, stock, *, expected_vermagic=VERMAGIC, aligne
         name = cstring(versions[offset+8:offset+64], 0)
         if not name or name in rows:
             raise ValueError("Empty or duplicate module version record")
+        # The headset's stock modules are the source of truth: wherever the device
+        # publishes a CRC for a symbol, the module must carry exactly that value.
+        # Symbols no stock module imports fall back to this build's Module.symvers.
         if aligned and name in aligned:
             if crc != aligned[name]:
                 raise ValueError(
                     f"{name} is not aligned to the device CRC 0x{aligned[name]:08x}")
+        elif name in stock:
+            if stock[name] != crc:
+                raise ValueError(
+                    f"Device CRC mismatch for {name}: module has 0x{crc:08x}, "
+                    f"stock kernel has 0x{stock[name]:08x}")
         elif generated.get(name) != crc:
             raise ValueError("Missing or mismatching generated CRC: " + name)
         # The device reference covers only symbols that some stock vendor module
         # also imports, so it is a cross-check wherever it overlaps; every module
         # always imports module_layout, which makes it a mandatory anchor.
-        if name in stock and stock[name] != crc:
-            raise ValueError(
-                f"Device CRC mismatch for {name}: module has 0x{crc:08x}, stock kernel has 0x{stock[name]:08x}")
         rows[name] = f"0x{crc:08x}"
     if "module_layout" not in rows or not undefined <= rows.keys():
         raise ValueError("Undefined symbol lacks a version record or module_layout is missing")
@@ -376,6 +381,24 @@ def rewrite_crc(module_path, symbol, value, *, dry_run):
 
 
 def cmd_align(args):
+    if args.all_from is not None:
+        reference = json.loads(args.all_from.read_text())
+        symbols = {key: int(value, 16) for key, value in reference["symbols"].items()}
+        data = args.module.read_bytes()
+        rewritten = 0
+        for symbol, value in sorted(symbols.items()):
+            try:
+                previous, updated, changed = rewrite_crc(
+                    args.module, symbol, value, dry_run=args.dry_run)
+            except ValueError:
+                continue
+            if not changed:
+                continue
+            rewritten += 1
+            state = "would rewrite" if args.dry_run else "rewritten"
+            print(f"ALIGN: {args.module.name} {symbol} 0x{previous:08x} -> 0x{updated:08x} ({state})")
+        print(f"ALIGN: {args.module.name} {rewritten} CRC(s) aligned to {args.all_from.name}")
+        return
     value = int(args.crc, 16)
     previous, updated, changed = rewrite_crc(args.module, args.symbol, value, dry_run=args.dry_run)
     state = "already aligned" if not changed else ("would rewrite" if args.dry_run else "rewritten")
@@ -411,8 +434,10 @@ def main():
 
     align = subs.add_parser("align", help="align one recorded device CRC in a module")
     align.add_argument("module", type=Path)
-    align.add_argument("--symbol", required=True)
-    align.add_argument("--crc", required=True)
+    align.add_argument("--symbol")
+    align.add_argument("--crc")
+    align.add_argument("--all-from", type=Path,
+                       help="rewrite every recorded CRC that differs from this reference")
     align.add_argument("--dry-run", action="store_true")
     align.set_defaults(func=cmd_align)
 
