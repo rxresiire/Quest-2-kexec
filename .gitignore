@@ -1,0 +1,4 @@
+actionlint.exe
+fix_heredoc*.py
+push_fix*.bat
+*.log
