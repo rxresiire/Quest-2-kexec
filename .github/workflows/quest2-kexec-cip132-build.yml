@@ -86,16 +86,38 @@ jobs:
             libtinfo5 binutils-aarch64-linux-gnu kmod curl python3 git \
             jq cpio
 
+      - name: Restore clang-r450784e toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/clang-r450784e
+          key: clang-r450784e-425c8149f17c8d9914bf690b4d5abe45a13fb993
+
       - name: Fetch clang-r450784e (Android toolchain)
         id: clang
         run: |
           CLANG_DIR="${{ runner.temp }}/clang-r450784e"
-          mkdir -p "$CLANG_DIR"
+          ARCHIVE="${{ runner.temp }}/clang-r450784e.tar.gz"
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/425c8149f17c8d9914bf690b4d5abe45a13fb993/clang-r450784e.tar.gz"
           if [[ ! -x "$CLANG_DIR/bin/clang" ]]; then
-            curl --fail --location --retry 3 \
-              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/425c8149f17c8d9914bf690b4d5abe45a13fb993/clang-r450784e.tar.gz" \
-              | tar -xz -C "$CLANG_DIR"
+            for attempt in 1 2 3 4 5; do
+              echo "Toolchain download attempt $attempt"
+              rm -rf "$CLANG_DIR" "$ARCHIVE"
+              mkdir -p "$CLANG_DIR"
+              curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
+                   --connect-timeout 30 --max-time 900 -o "$ARCHIVE" "$URL" || true
+              if tar -tzf "$ARCHIVE" > /dev/null 2>&1; then
+                tar -xzf "$ARCHIVE" -C "$CLANG_DIR"
+                break
+              fi
+              echo "::warning::toolchain archive is incomplete or corrupt; retrying"
+            done
+            rm -f "$ARCHIVE"
           fi
+          if [[ ! -x "$CLANG_DIR/bin/clang" ]]; then
+            echo "::error::clang-r450784e could not be materialised"
+            exit 1
+          fi
+          "$CLANG_DIR/bin/clang" --version | head -1
           echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_OUTPUT"
           echo "CLANG_BIN=$CLANG_DIR/bin" >> "$GITHUB_OUTPUT"
 
