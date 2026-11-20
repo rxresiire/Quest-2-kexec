@@ -366,6 +366,9 @@ jobs:
           QKX_FLAG=""
           if [[ "${{ inputs.experimental }}" == "true" ]]; then
             QKX_FLAG="QKX_EXPERIMENTAL=1"
+            # Recorded in the provenance and audit manifest: this artifact carries
+            # the board shutdown/handoff path and must not be treated as stage-only.
+            echo "QKX_EXPERIMENTAL=1" >> "$GITHUB_ENV"
           fi
 
           read -r -a kflags <<< "$KBUILD_FLAGS"
@@ -401,12 +404,17 @@ jobs:
       - name: Audit modules (cip132-st16)
         run: |
           cd "${{ github.workspace }}/clean_repo"
+          AUDIT_FLAGS=""
+          if [[ "${{ inputs.experimental }}" == "true" ]]; then
+            AUDIT_FLAGS="--allow-experimental-jump"
+          fi
           python3 quest2_audit_cip132.py modules \
             --symvers "$KERNEL_OUT/Module.symvers" \
             --config "$KERNEL_OUT/.config" \
             --config-sha "${{ steps.config.outputs.CONFIG_SHA }}" \
             --stock-crcs config/q2-device-crcs.json \
             --loader-command "$MODULE_DIR/.loader.o.cmd" \
+            $AUDIT_FLAGS \
             --output "${{ runner.temp }}/audit-manifest.json" \
             "$MODULE_DIR"/quest_kexec.ko "$MODULE_DIR"/marker_read.ko \
             "$MODULE_DIR"/usb_log.ko "$MODULE_DIR"/camera_dsp_diag.ko
@@ -456,8 +464,9 @@ jobs:
               "kernel_image_sha256": sha256sum(os.path.join(kernel_out, "arch", "arm64", "boot", "Image")),
               "module_symvers_sha256": sha256sum(os.path.join(kernel_out, "Module.symvers")),
               "quest_kexec_sha256": sha256sum(os.path.join(os.environ['MODULE_DIR'], "quest_kexec.ko")),
-              "stage_only": True,
-              "hardware_handoff": "unproven",
+              "experimental_jump": os.environ.get('QKX_EXPERIMENTAL') == '1',
+              "stage_only": os.environ.get('QKX_EXPERIMENTAL') != '1',
+              "hardware_handoff": "experimental" if os.environ.get('QKX_EXPERIMENTAL') == '1' else "unproven",
               "deployment_performed": False,
           }
           with open(os.path.join(os.environ['RUNNER_TEMP'], "build-provenance.json"), 'w') as handle:
@@ -466,6 +475,7 @@ jobs:
           KERNEL_OUT="$KERNEL_OUT" KERNEL_SRC="${{ steps.kernel.outputs.KERNEL_SRC }}" \
           KERNEL_SOURCE="$KERNEL_SOURCE" TARGET_BUILD="$TARGET_BUILD" \
           CONFIG_SOURCE="${{ steps.config.outputs.CONFIG_SOURCE }}" \
+          QKX_EXPERIMENTAL="$QKX_EXPERIMENTAL" \
           GITHUB_WORKSPACE="${{ github.workspace }}" MODULE_DIR="$MODULE_DIR" \
           RUNNER_TEMP="${{ runner.temp }}" \
             python3 "${{ runner.temp }}/generate_provenance.py"
@@ -494,7 +504,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: quest2-kexec-cip132-${{ github.run_id }}
+          name: quest2-kexec-cip132-${{ github.run_id }}${{ inputs.experimental && '-experimental' || '' }}
           path: ${{ runner.temp }}/artifacts/**
           retention-days: 30
 

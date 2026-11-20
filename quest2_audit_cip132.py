@@ -317,15 +317,21 @@ def cmd_modules(args):
         symbol, _, value = item.partition("=")
         aligned[symbol.strip()] = int(value.strip(), 16)
     command = args.loader_command.read_text()
-    if "-DQKX_ENABLE_EXPERIMENTAL_JUMP" in command:
+    experimental = "-DQKX_ENABLE_EXPERIMENTAL_JUMP" in command
+    if experimental and not args.allow_experimental_jump:
         raise ValueError("Experimental jump was enabled in the effective compile command")
+    if experimental:
+        print("AUDIT_WARNING: experimental jump build; hardware shutdown/handoff paths are "
+              "compiled in and the artifact is not a stage-only module")
     stock_path = Path(args.stock_crcs or Path(__file__).with_name("quest2_stock_crcs_cip132.json"))
     stock_doc = json.loads(stock_path.read_text())
     provenance = stock_doc.get("provenance", "unknown")
     stock = {key: int(value, 16) for key, value in stock_doc["symbols"].items()}
     generated = load_symvers(args.symvers)
     manifest = {"schema_version": 1, "config_sha256": config_hash,
-                "stage_only": True, "hardware_handoff": "unproven",
+                "stage_only": not experimental,
+                "experimental_jump": experimental,
+                "hardware_handoff": "experimental" if experimental else "unproven",
                 "stock_crc_provenance": provenance,
                 "device_aligned_crcs": {key: f"0x{value:08x}" for key, value in aligned.items()},
                 "modules": []}
@@ -428,6 +434,9 @@ def main():
                        metavar="SYMBOL=0xCRC",
                        help="symbol whose CRC was deliberately aligned to the device")
     audit.add_argument("--loader-command", type=Path, required=True)
+    audit.add_argument("--allow-experimental-jump", action="store_true",
+                       help="record and accept a QKX_ENABLE_EXPERIMENTAL_JUMP build "
+                            "(default: refuse it)")
     audit.add_argument("--output", type=Path, required=True)
     audit.add_argument("modules", nargs="+", type=Path)
     audit.set_defaults(func=cmd_modules)
