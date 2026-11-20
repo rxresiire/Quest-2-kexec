@@ -62,12 +62,21 @@ jobs:
         with:
           path: clean_repo
 
-      - name: Apply our modified module files
+      # The module sources are used exactly as the upstream project ships them.
+      # Our earlier local fork (loader.c + shutdown_backends.c) does not compile
+      # against this tree: it calls qkx_test_transition before declaring it and
+      # includes <linux/soc/qcom/scm.h>, which this kernel does not provide.
+      - name: Verify module sources are upstream
         run: |
           cd "${{ github.workspace }}/witherblitz/module"
-          cp "${{ github.workspace }}/clean_repo/module/loader.c" .
-          cp "${{ github.workspace }}/clean_repo/module/shutdown_backends.c" .
-          cp "${{ github.workspace }}/clean_repo/module/Makefile" .
+          test -f loader.c && test -f transition.S && test -f shutdown.c
+          test -f shutdown_io.c && test -f Makefile
+          grep -q 'quest_kexec-y := loader.o transition.o shutdown.o shutdown_io.o' Makefile
+          if grep -rq 'shutdown_backends' .; then
+            echo "::error::stale loader fork detected in module sources"
+            exit 1
+          fi
+          echo "Module sources are the upstream staging-only build."
 
       - name: Install build dependencies
         run: |
@@ -292,7 +301,7 @@ jobs:
             2>&1 | tee "${{ runner.temp }}/loader-build.log"
 
           cp quest_kexec.ko marker_read.ko usb_log.ko camera_dsp_diag.ko "$MODULE_DIR/"
-          cp .loader.o.cmd .transition.o.cmd .shutdown.o.cmd .shutdown_io.o.cmd .shutdown_backends.o.cmd "$MODULE_DIR/" 2>/dev/null || true
+          cp .loader.o.cmd .transition.o.cmd .shutdown.o.cmd .shutdown_io.o.cmd "$MODULE_DIR/" 2>/dev/null || true
 
       - name: Validate module
         run: |
@@ -310,7 +319,7 @@ jobs:
             --symvers "$KERNEL_OUT/Module.symvers" \
             --config "$KERNEL_OUT/.config" \
             --config-sha "${{ steps.config.outputs.CONFIG_SHA }}" \
-            --loader-command module/Makefile \
+            --loader-command "${{ github.workspace }}/witherblitz/module/Makefile" \
             --output "${{ runner.temp }}/audit-manifest.json" \
             "$MODULE_DIR"/quest_kexec.ko "$MODULE_DIR"/marker_read.ko \
             "$MODULE_DIR"/usb_log.ko "$MODULE_DIR"/camera_dsp_diag.ko
