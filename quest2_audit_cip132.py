@@ -35,13 +35,37 @@ REQUIRED_OPTIONS = {
     "CONFIG_MODVERSIONS": "y",
     "CONFIG_KALLSYMS": "y",
     "CONFIG_KALLSYMS_ALL": "y",
-    # Compiler provenance: the Quest 2 image is clang-built. A config whose
-    # capability probes came from GCC would silently drop FORTIFY_SOURCE and
-    # friends, so both are hard gates rather than warnings.
+    # Compiler provenance: the Quest 2 image is clang-built, and the module has
+    # to be built by the same compiler family so its Kconfig capability probes
+    # (CC_HAS_*) match the running kernel. This is a hard gate, not a warning.
     "CONFIG_CC_IS_CLANG": "y",
 }
-HARDENING_OPTIONS = {
-    "CONFIG_FORTIFY_SOURCE": "harden common str/mem functions against overflow",
+# Hardening is reported, never assumed. Each entry is the value this source tree
+# can actually produce for a clang build, with the reason it is pinned there.
+# security/Kconfig gates FORTIFY_SOURCE on "depends on !CC_IS_CLANG"
+# (llvm.org/50322, llvm.org/41459), so a clang build cannot enable it no matter
+# what the defconfig asks for. Sanitizers, SCS, CFI and LTO are likewise off in
+# a production image; expecting them would only make the gate lie.
+HARDENING_EXPECTATIONS = {
+    "CONFIG_FORTIFY_SOURCE": ("n", "gated on !CC_IS_CLANG by security/Kconfig"),
+    "CONFIG_KASAN": ("n", "sanitizer, not part of a production image"),
+    "CONFIG_KASAN_STACK": ("n", "sanitizer, not part of a production image"),
+    "CONFIG_SHADOW_CALL_STACK": ("n", "arm64 SCS is off in this vendor image"),
+    "CONFIG_UBSAN": ("n", "sanitizer, not part of a production image"),
+    "CONFIG_CFI_CLANG": ("n", "CFI is off in this vendor image"),
+    "CONFIG_LTO_CLANG": ("n", "LTO is off in this vendor image"),
+}
+# Informational only: printed so every run states what the toolchain produced.
+REPORTED_OPTIONS = {
+    "CONFIG_STACKPROTECTOR": "stack protector",
+    "CONFIG_STACKPROTECTOR_STRONG": "strong stack protector",
+    "CONFIG_HARDENED_USERCOPY": "hardened usercopy",
+    "CONFIG_STRICT_KERNEL_RWX": "strict kernel RWX",
+    "CONFIG_STRICT_MODULE_RWX": "strict module RWX",
+    "CONFIG_INIT_STACK_NONE": "no stack init",
+    "CONFIG_INIT_STACK_ALL": "stack init all",
+    "CONFIG_BUG_ON_DATA_CORRUPTION": "bug on data corruption",
+    "CONFIG_DEBUG_LIST": "list debugging",
 }
 FORBIDDEN_OPTIONS = {
     "CONFIG_KEXEC": "the stock kernel is built with kexec disabled",
@@ -85,10 +109,20 @@ def validate_config(data, *, require_digest):
     if missing:
         raise ConfigError("Configuration lacks required options: " + ", ".join(missing))
 
-    dropped = [f"{name} ({reason})" for name, reason in HARDENING_OPTIONS.items()
-               if options.get(name) != "y"]
-    if dropped:
-        raise ConfigError("Configuration lost required hardening: " + ", ".join(dropped))
+    for name, (want, reason) in HARDENING_EXPECTATIONS.items():
+        actual = options.get(name, "n")
+        state = "off" if actual in ("n", "0") else actual
+        print(f"HARDENING: {name}={state} (expected {want}: {reason})")
+        if actual != want:
+            raise ConfigError(
+                f"{name}={actual} but this toolchain/source combination produces {want} ({reason})")
+    for name, label in REPORTED_OPTIONS.items():
+        print(f"REPORT: {name}={options.get(name, 'n')} ({label})")
+    print(f"REPORT: CONFIG_CC_IS_CLANG={options.get('CONFIG_CC_IS_CLANG', 'n')} "
+          f"CONFIG_CLANG_VERSION={options.get('CONFIG_CLANG_VERSION', 'unknown')}")
+    print(f"REPORT: CONFIG_SMP={options.get('CONFIG_SMP', 'n')} "
+          f"CONFIG_PREEMPT={options.get('CONFIG_PREEMPT', 'n')} "
+          f"CONFIG_MODVERSIONS={options.get('CONFIG_MODVERSIONS', 'n')}")
 
     enabled = [name for name in FORBIDDEN_OPTIONS if options.get(name) == "y"]
     if enabled:
