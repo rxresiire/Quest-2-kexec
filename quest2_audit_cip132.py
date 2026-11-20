@@ -111,9 +111,11 @@ def validate_config(data, *, require_digest):
 
     for name, (want, reason) in HARDENING_EXPECTATIONS.items():
         actual = options.get(name, "n")
-        state = "off" if actual in ("n", "0") else actual
+        # Kconfig writes bools as y/n and numeric symbols as 0/1/2/..., so a
+        # disabled numeric option such as CONFIG_KASAN_STACK=0 means "off".
+        state = "n" if actual in ("n", "0") else actual
         print(f"HARDENING: {name}={state} (expected {want}: {reason})")
-        if actual != want:
+        if state != want:
             raise ConfigError(
                 f"{name}={actual} but this toolchain/source combination produces {want} ({reason})")
     for name, label in REPORTED_OPTIONS.items():
