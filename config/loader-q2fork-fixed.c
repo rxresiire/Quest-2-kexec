@@ -920,6 +920,16 @@ static int __maybe_unused qkx_execute(void)
 	pr_emerg("quest_kexec: about to enter: pgd=0x%llx code=0x%llx desc=0x%llx entry=0x%llx dtb=0x%llx\n",
 		virt_to_phys(pgd_page), virt_to_phys(code_page),
 		virt_to_phys(first_desc), qkx_entry, QKX_DTB);
+	/* Marker: prove we reached qkx_enter from the old kernel before jump */
+	{
+		loff_t mpos = 0;
+		struct file *mf = filp_open("/data/local/tmp/qkx_enter_reached",
+			O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (!IS_ERR(mf)) {
+			kernel_write(mf, "QKX_ENTER_REACHED\n", 18, &mpos);
+			filp_close(mf, NULL);
+		}
+	}
 	qkx_enter(virt_to_phys(pgd_page), virt_to_phys(code_page),
 		virt_to_phys(first_desc), qkx_entry, QKX_DTB);
 release_devices:
