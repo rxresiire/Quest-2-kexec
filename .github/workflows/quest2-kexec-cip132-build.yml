@@ -18,11 +18,11 @@ on:
         description: 'Module sources: witherblitz (staging-only) or q2fork (Quest 2 port, jump enabled)'
         type: choice
         options: [witherblitz, q2fork]
-        default: witherblitz
+        default: q2fork
       experimental:
         description: 'Enable QKX_EXPERIMENTAL=1 for hardware transition code (DANGEROUS)'
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
