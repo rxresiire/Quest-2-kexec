@@ -236,13 +236,13 @@ jobs:
             SOURCE=device-secret
             echo "Kernel config came from the device secret and matched the pinned digest."
             cp "$PREPARED" "$KERNEL_OUT/.config"
-          elif [[ -f "${{ github.workspace }}/clean_repo/config/q2-stock.config" ]]; then
+          elif [[ -f "${{ github.workspace }}/config/q2-stock.config" ]]; then
             # The headset's own /proc/config.gz (firmware 52322490022300150) is the
             # authoritative configuration: struct layout probes such as
             # module_layout's CRC follow from it, so this is what the module must be
             # built against. It is committed as config/q2-stock.config.
             echo "Using the device's own /proc/config.gz (config/q2-stock.config)."
-            cp "${{ github.workspace }}/clean_repo/config/q2-stock.config" "$KERNEL_OUT/.config"
+            cp "${{ github.workspace }}/config/q2-stock.config" "$KERNEL_OUT/.config"
             # LOCALVERSION_AUTO would append this clone's commit hash on top of the
             # device's own -g suffix; disabling it keeps vermagic byte-identical to
             # the headset. It affects only the version string, never struct layout,
@@ -389,7 +389,7 @@ jobs:
           # header data) causes an immediate kernel panic. Fix: read text_offset
           # from the Image header and jump to QKX_ENTRY + text_offset instead.
           if [[ "${{ env.MODULE_SOURCE }}" == "q2fork" ]]; then
-            cp "${{ github.workspace }}/clean_repo/config/loader-q2fork-fixed.c" loader.c
+            cp "${{ github.workspace }}/config/loader-q2fork-fixed.c" loader.c
           fi
           QKX_FLAG=""
           # q2fork's Makefile enables the jump unconditionally; the witheblitz
