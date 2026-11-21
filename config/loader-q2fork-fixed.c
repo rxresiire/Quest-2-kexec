@@ -917,6 +917,9 @@ static int __maybe_unused qkx_execute(void)
 	for (i = 0; i < nr_owned; i++)
 		__flush_dcache_area(page_address(owned[i]), PAGE_SIZE);
 	__flush_icache_range((unsigned long)code_page, (unsigned long)code_page + PAGE_SIZE);
+	pr_emerg("quest_kexec: about to enter: pgd=0x%llx code=0x%llx desc=0x%llx entry=0x%llx dtb=0x%llx\n",
+		virt_to_phys(pgd_page), virt_to_phys(code_page),
+		virt_to_phys(first_desc), qkx_entry, QKX_DTB);
 	qkx_enter(virt_to_phys(pgd_page), virt_to_phys(code_page),
 		virt_to_phys(first_desc), qkx_entry, QKX_DTB);
 release_devices:
