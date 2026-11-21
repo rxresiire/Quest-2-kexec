@@ -1,0 +1,34 @@
+--- a/loader.c
++++ b/loader.c
+@@ -1006,7 +1006,7 @@ static int __init qkx_init(void)
+ 	struct file *kf = NULL, *rf = NULL, *df = NULL;
+ 	u8 kh[64], dh[40];
+-	u64 ksize, rsize, dsize, image_size, flags;
++	u64 ksize, rsize, dsize, image_size, flags, text_offset, entry;
+ 	loff_t pos = 0;
+ 	int ret;
+ 	int (*walk_ram)(u64, u64, void *, int (*)(struct resource *, void *));
+@@ -1078,6 +1078,7 @@ static int __init qkx_init(void)
+ 	image_size = get_unaligned_le64(kh + 16);
+ 	flags = get_unaligned_le64(kh + 24);
++	text_offset = get_unaligned_le64(kh + 8);
+ 	ret = -EINVAL;
+ 	if (memcmp(kh + 56, "ARM\x64", 4) || get_unaligned_le64(kh + 8) != SZ_512K ||
+ 	    image_size < ksize || image_size > QKX_INITRD - QKX_ENTRY ||
+@@ -1086,6 +1087,7 @@ static int __init qkx_init(void)
+ 	    (flags & 1) || !(flags & 8) || ((flags & 6) != 0 && (flags & 6) != 2))
+ 		goto out;
++	entry = QKX_ENTRY + text_offset;
+ 	pos = 0;
+ 	ret = qkx_read(df, dh, sizeof(dh), &pos);
+@@ -1104,7 +1105,7 @@ static int __init qkx_init(void)
+ 	if (!ret) {
+-		pr_info("quest_kexec: staged %u copy pages, %u allocations; entry=%llx dtb=%llx; execute=%u\n",
++		pr_info("quest_kexec: staged %u copy pages, %u allocations; entry=%llx dtb=%llx; execute=%u\n",
+ 			nr_copies, nr_owned, entry, QKX_DTB, execute);
+@@ -1118,7 +1119,7 @@ static int __init qkx_init(void)
+ 	__flush_icache_range((unsigned long)code_page, (unsigned long)code_page + PAGE_SIZE);
+-	qkx_enter(virt_to_phys(pgd_page), virt_to_phys(code_page),
+-		virt_to_phys(first_desc), QKX_ENTRY, QKX_DTB);
++	qkx_enter(virt_to_phys(pgd_page), virt_to_phys(code_page),
++		virt_to_phys(first_desc), entry, QKX_DTB);

@@ -381,6 +381,13 @@ jobs:
           mkdir -p "$MODULE_DIR"
 
           cd "${{ github.workspace }}/modulesrc/module"
+          # q2fork jumps to the Image header (offset 0) instead of text_offset.
+          # The Quest 2 cip132 Image has text_offset=0x80000, so the kernel entry
+          # is at QKX_ENTRY+text_offset, not QKX_ENTRY. Apply the entry fix only
+          # for q2fork; witherblitz is unaffected.
+          if [[ "${{ inputs.module_source }}" == "q2fork" ]]; then
+            patch -p1 < "${{ github.workspace }}/clean_repo/config/q2fork-entry-fix.patch"
+          fi
           QKX_FLAG=""
           # q2fork's Makefile enables the jump unconditionally; the witheblitz
           # sources need the explicit flag. Both record it in the provenance.
