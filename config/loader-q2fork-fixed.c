@@ -35,6 +35,7 @@
 #define QKX_ENTRY 0x90080000ULL
 #define QKX_INITRD 0x93000000ULL
 #define QKX_DTB 0x93200000ULL
+#define QKX_ENABLE_EXPERIMENTAL_JUMP 1
 /* Includes held allocations that land inside the destination window. */
 #define QKX_MAX_PAGES 32768
 #define QKX_DESC_COUNT ((PAGE_SIZE - 16) / 16)
