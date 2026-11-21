@@ -36,6 +36,8 @@ concurrency:
 env:
   TARGET_BUILD: ${{ inputs.target_build || '52322490022300150' }}
   KERNEL_SOURCE: ${{ inputs.kernel_source || 'oculus' }}
+  MODULE_SOURCE: ${{ inputs.module_source || 'q2fork' }}
+  EXPERIMENTAL: ${{ inputs.experimental || true }}
 
 jobs:
   build:
@@ -67,7 +69,7 @@ jobs:
       - name: Checkout module sources
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.module_source == 'q2fork' && 'machachu56/quest-kexec-q2' || 'WitherBlitz/Quest-2-Steam-OS-Dual-Boot' }}
+          repository: ${{ env.MODULE_SOURCE == 'q2fork' && 'machachu56/quest-kexec-q2' || 'WitherBlitz/Quest-2-Steam-OS-Dual-Boot' }}
           persist-credentials: false
           path: modulesrc
 
@@ -83,7 +85,7 @@ jobs:
         run: |
           cd "${{ github.workspace }}/modulesrc/module"
           test -f loader.c && test -f transition.S && test -f Makefile
-          if [[ "${{ inputs.module_source }}" == "q2fork" ]]; then
+          if [[ "${{ env.MODULE_SOURCE }}" == "q2fork" ]]; then
             grep -q 'quest_kexec-y := loader.o transition.o' Makefile
             echo "Module sources are the quest-kexec-q2 Quest 2 port."
           else
@@ -386,13 +388,13 @@ jobs:
           # code starts 512KB into the file. Jumping to QKX_ENTRY (offset 0 =
           # header data) causes an immediate kernel panic. Fix: read text_offset
           # from the Image header and jump to QKX_ENTRY + text_offset instead.
-          if [[ "${{ inputs.module_source }}" == "q2fork" ]]; then
+          if [[ "${{ env.MODULE_SOURCE }}" == "q2fork" ]]; then
             cp "${{ github.workspace }}/clean_repo/config/loader-q2fork-fixed.c" loader.c
           fi
           QKX_FLAG=""
           # q2fork's Makefile enables the jump unconditionally; the witheblitz
           # sources need the explicit flag. Both record it in the provenance.
-          if [[ "${{ inputs.experimental }}" == "true" || "${{ inputs.module_source }}" == "q2fork" ]]; then
+          if [[ "${{ env.EXPERIMENTAL }}" == "true" || "${{ env.MODULE_SOURCE }}" == "q2fork" ]]; then
             QKX_FLAG="QKX_EXPERIMENTAL=1"
             echo "QKX_EXPERIMENTAL=1" >> "$GITHUB_ENV"
           fi
@@ -432,7 +434,7 @@ jobs:
         run: |
           cd "${{ github.workspace }}/clean_repo"
           AUDIT_FLAGS=""
-          if [[ "${{ inputs.experimental }}" == "true" || "${{ inputs.module_source }}" == "q2fork" ]]; then
+          if [[ "${{ env.EXPERIMENTAL }}" == "true" || "${{ env.MODULE_SOURCE }}" == "q2fork" ]]; then
             AUDIT_FLAGS="--allow-experimental-jump"
           fi
           python3 quest2_audit_cip132.py modules \
@@ -502,7 +504,7 @@ jobs:
           KERNEL_SOURCE="$KERNEL_SOURCE" TARGET_BUILD="$TARGET_BUILD" \
           CONFIG_SOURCE="${{ steps.config.outputs.CONFIG_SOURCE }}" \
           QKX_EXPERIMENTAL="$QKX_EXPERIMENTAL" \
-          MODULE_SOURCE_REPO="${{ inputs.module_source == 'q2fork' && 'machachu56/quest-kexec-q2' || 'WitherBlitz/Quest-2-Steam-OS-Dual-Boot' }}" \
+          MODULE_SOURCE_REPO="${{ env.MODULE_SOURCE == 'q2fork' && 'machachu56/quest-kexec-q2' || 'WitherBlitz/Quest-2-Steam-OS-Dual-Boot' }}" \
           GITHUB_WORKSPACE="${{ github.workspace }}" MODULE_DIR="$MODULE_DIR" \
           RUNNER_TEMP="${{ runner.temp }}" \
             python3 "${{ runner.temp }}/generate_provenance.py"
@@ -531,7 +533,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: quest2-kexec-cip132-${{ github.run_id }}${{ inputs.experimental && '-experimental' || '' }}
+          name: quest2-kexec-cip132-${{ github.run_id }}${{ env.EXPERIMENTAL == 'true' && '-experimental' || '' }}
           path: ${{ runner.temp }}/artifacts/**
           retention-days: 30
 
