@@ -308,7 +308,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/android-out
-          key: kout-${{ steps.kernel.outputs.KERNEL_HEAD }}-${{ steps.config.outputs.CONFIG_SHA }}-llvm-r450784e
+          key: kout-${{ steps.kernel.outputs.KERNEL_HEAD }}-${{ steps.config.outputs.CONFIG_SHA }}-llvm-r450784e${{ env.EXPERIMENTAL == 'true' && '-exp' || '' }}
 
       - name: Build kernel
         id: build
@@ -375,7 +375,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/android-out
-          key: kout-${{ steps.kernel.outputs.KERNEL_HEAD }}-${{ steps.config.outputs.CONFIG_SHA }}-llvm-r450784e
+          key: kout-${{ steps.kernel.outputs.KERNEL_HEAD }}-${{ steps.config.outputs.CONFIG_SHA }}-llvm-r450784e${{ env.EXPERIMENTAL == 'true' && '-exp' || '' }}
 
       - name: Build quest_kexec module
         run: |
