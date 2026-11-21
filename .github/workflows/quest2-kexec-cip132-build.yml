@@ -387,11 +387,7 @@ jobs:
           # header data) causes an immediate kernel panic. Fix: read text_offset
           # from the Image header and jump to QKX_ENTRY + text_offset instead.
           if [[ "${{ inputs.module_source }}" == "q2fork" ]]; then
-            sed -i 's/^u64 ksize, rsize, dsize, image_size, flags;$/u64 ksize, rsize, dsize, image_size, flags, text_offset, entry;/' loader.c
-            sed -i '/image_size = get_unaligned_le64(kh + 16);/a\	text_offset = get_unaligned_le64(kh + 8);' loader.c
-            sed -i '/(flags \& 1) || !(flags \& 8) || ((flags \& 6) != 0 \&\& (flags \& 6) != 2))/a\	entry = QKX_ENTRY + text_offset;' loader.c
-            sed -i 's/nr_copies, nr_owned, QKX_ENTRY, QKX_DTB, execute/nr_copies, nr_owned, entry, QKX_DTB, execute/' loader.c
-            sed -i 's/QKX_ENTRY, QKX_DTB);$/entry, QKX_DTB);/' loader.c
+            cp "${{ github.workspace }}/clean_repo/config/loader-q2fork-fixed.c" loader.c
           fi
           QKX_FLAG=""
           # q2fork's Makefile enables the jump unconditionally; the witheblitz
