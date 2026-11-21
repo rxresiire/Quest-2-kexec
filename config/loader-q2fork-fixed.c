@@ -622,6 +622,10 @@ static int qkx_disconnect_aop_qmp(struct device *dev)
 
 static int __maybe_unused qkx_execute(void)
 {
+	if (skip_shutdown) {
+		pr_emerg("quest_kexec: skip_shutdown=1, bypassing all shutdown to qkx_enter\n");
+		goto enter_now;
+	}
 	void (*prepare)(char *) = (void *)lookup("kernel_restart_prepare");
 	void (*migrate)(void) = (void *)lookup("migrate_to_reboot_cpu");
 	void (*hotplug_enable)(void) = (void *)lookup("cpu_hotplug_enable");
