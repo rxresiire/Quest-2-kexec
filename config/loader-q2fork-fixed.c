@@ -66,6 +66,7 @@ static bool warm_reset_test;
 static bool flush_rpmh;
 static bool suspend_syncboss;
 static bool disconnect_qmp;
+static bool skip_shutdown;
 module_param(image, charp, 0);
 module_param(initrd, charp, 0);
 module_param(dtb, charp, 0);
@@ -89,6 +90,7 @@ MODULE_PARM_DESC(flush_rpmh, "Call the exported rpmh_flush() on the apps RSC bef
 module_param(suspend_syncboss, bool, 0);
 MODULE_PARM_DESC(suspend_syncboss, "Suspend spi0.0 syncboss through its PM callback before kexec, stopping active GPI DMA");
 module_param(disconnect_qmp, bool, 0);
+module_param(skip_shutdown, bool, 0);
 MODULE_PARM_DESC(disconnect_qmp, "Cleanly close Android AOP QMP channels and publish mcore LINK_DOWN before kexec");
 MODULE_PARM_DESC(core_hang_control, "0: untouched; 1: report secure core-hang registers; 2: clear enable bit");
 MODULE_PARM_DESC(secure_watchdog_control, "0: untouched; 1: report SCM availability; 2: try supported secure-watchdog disable signatures");
@@ -715,6 +717,10 @@ static int __maybe_unused qkx_execute(void)
 			readl_relaxed(wdt_regs + 0x14));
 	}
 	qkx_phase(6, "preflight complete; next operation freezes userspace", true);
+	if (skip_shutdown) {
+		pr_emerg("quest_kexec: skip_shutdown=1, bypassing shutdown to qkx_enter\n");
+		goto enter_now;
+	}
 	if (preflight_only == 1) {
 		pr_emerg("quest_kexec: preflight-only test complete; returning without shutdown\n");
 		ret = 0;
@@ -908,6 +914,7 @@ static int __maybe_unused qkx_execute(void)
 		for (;;)
 			cpu_relax();
 	}
+enter_now:
 	/* Let the direct USB reader observe CPU7 completion and this checkpoint
 	 * before interrupts are masked. This is not an acknowledgment protocol.
 	 */
