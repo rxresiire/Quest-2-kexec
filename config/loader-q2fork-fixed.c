@@ -60,6 +60,7 @@ static bool post_shutdown_probe;
 static unsigned int preflight_only;
 static unsigned int core_hang_control;
 static unsigned int secure_watchdog_control;
+static u64 qkx_entry;
 static bool warm_reset_test;
 static bool flush_rpmh;
 static bool suspend_syncboss;
@@ -917,7 +918,7 @@ static int __maybe_unused qkx_execute(void)
 		__flush_dcache_area(page_address(owned[i]), PAGE_SIZE);
 	__flush_icache_range((unsigned long)code_page, (unsigned long)code_page + PAGE_SIZE);
 	qkx_enter(virt_to_phys(pgd_page), virt_to_phys(code_page),
-		virt_to_phys(first_desc), entry, QKX_DTB);
+		virt_to_phys(first_desc), qkx_entry, QKX_DTB);
 release_devices:
 	if (syncboss_suspended && syncboss && syncboss->driver &&
 	    syncboss->driver->pm && syncboss->driver->pm->resume)
@@ -1086,6 +1087,7 @@ static int __init qkx_init(void)
 	    (flags & 1) || !(flags & 8) || ((flags & 6) != 0 && (flags & 6) != 2))
 		goto out;
 	entry = QKX_ENTRY + text_offset;
+	qkx_entry = entry;
 	pos = 0;
 	ret = qkx_read(df, dh, sizeof(dh), &pos);
 	if (ret)
