@@ -395,8 +395,8 @@ jobs:
           # q2fork's Makefile enables the jump unconditionally; the witheblitz
           # sources need the explicit flag. Both record it in the provenance.
           if [[ "${{ env.EXPERIMENTAL }}" == "true" || "${{ env.MODULE_SOURCE }}" == "q2fork" ]]; then
-            QKX_FLAG="QKX_EXPERIMENTAL=1"
-            echo "QKX_EXPERIMENTAL=1" >> "$GITHUB_ENV"
+            QKX_FLAG="EXTRA_CFLAGS=-DQKX_ENABLE_EXPERIMENTAL_JUMP"
+            echo "QKX_ENABLE_EXPERIMENTAL_JUMP=1" >> "$GITHUB_ENV"
           fi
 
           read -r -a kflags <<< "$KBUILD_FLAGS"
