@@ -236,6 +236,15 @@ jobs:
             SOURCE=device-secret
             echo "Kernel config came from the device secret and matched the pinned digest."
             cp "$PREPARED" "$KERNEL_OUT/.config"
+            # The device's own config does not set CONFIG_PHYSICAL_START; the
+            # stock Image is linked for QCOM default 0x14688000 but our module
+            # stages it at QKX_ENTRY=0x90080000, causing an immediate panic
+            # on jump. Override it so the Image entry point matches the
+            # staging address.
+            "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x90080000
+            cd "$KERNEL_SRC"
+            make O="$KERNEL_OUT" "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig
+            cp "$KERNEL_OUT/.config" "$PREPARED"
           elif [[ -f "${{ github.workspace }}/clean_repo/config/q2-stock.config" ]]; then
             # The headset's own /proc/config.gz (firmware 52322490022300150) is the
             # authoritative configuration: struct layout probes such as
@@ -495,9 +504,9 @@ jobs:
               "kernel_image_sha256": sha256sum(os.path.join(kernel_out, "arch", "arm64", "boot", "Image")),
               "module_symvers_sha256": sha256sum(os.path.join(kernel_out, "Module.symvers")),
               "quest_kexec_sha256": sha256sum(os.path.join(os.environ['MODULE_DIR'], "quest_kexec.ko")),
-              "experimental_jump": os.environ.get('QKX_EXPERIMENTAL') == '1',
-              "stage_only": os.environ.get('QKX_EXPERIMENTAL') != '1',
-              "hardware_handoff": "experimental" if os.environ.get('QKX_EXPERIMENTAL') == '1' else "unproven",
+              "experimental_jump": os.environ.get('QKX_ENABLE_EXPERIMENTAL_JUMP') == '1',
+              "stage_only": os.environ.get('QKX_ENABLE_EXPERIMENTAL_JUMP') != '1',
+              "hardware_handoff": "experimental" if os.environ.get('QKX_ENABLE_EXPERIMENTAL_JUMP') == '1' else "unproven",
               "deployment_performed": False,
           }
           with open(os.path.join(os.environ['RUNNER_TEMP'], "build-provenance.json"), 'w') as handle:
@@ -506,7 +515,7 @@ jobs:
           KERNEL_OUT="$KERNEL_OUT" KERNEL_SRC="${{ steps.kernel.outputs.KERNEL_SRC }}" \
           KERNEL_SOURCE="$KERNEL_SOURCE" TARGET_BUILD="$TARGET_BUILD" \
           CONFIG_SOURCE="${{ steps.config.outputs.CONFIG_SOURCE }}" \
-          QKX_EXPERIMENTAL="$QKX_EXPERIMENTAL" \
+          QKX_ENABLE_EXPERIMENTAL_JUMP="$QKX_ENABLE_EXPERIMENTAL_JUMP" \
           MODULE_SOURCE_REPO="${{ env.MODULE_SOURCE == 'q2fork' && 'machachu56/quest-kexec-q2' || 'WitherBlitz/Quest-2-Steam-OS-Dual-Boot' }}" \
           GITHUB_WORKSPACE="${{ github.workspace }}" MODULE_DIR="$MODULE_DIR" \
           RUNNER_TEMP="${{ runner.temp }}" \
