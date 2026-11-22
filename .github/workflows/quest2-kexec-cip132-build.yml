@@ -353,6 +353,9 @@ jobs:
             exit 1
           fi
           echo "Audited config accepted unchanged by olddefconfig."
+          # Export the post-olddefconfig config hash so the audit step compares
+          # against the actual .config used to build both the Image and the module.
+          echo "CONFIG_SHA=$(sha256sum "$KERNEL_OUT/.config" | cut -d' ' -f1)" >> "$GITHUB_ENV"
 
           if [[ -s "$KERNEL_OUT/Module.symvers" && -s "$KERNEL_OUT/arch/arm64/boot/Image" ]]; then
             echo "Reusing cached kernel output: $(cat "$KERNEL_OUT/include/config/kernel.release")"
@@ -463,7 +466,7 @@ jobs:
           python3 quest2_audit_cip132.py modules \
             --symvers "$KERNEL_OUT/Module.symvers" \
             --config "$KERNEL_OUT/.config" \
-            --config-sha "${{ steps.config.outputs.CONFIG_SHA }}" \
+            --config-sha "${{ env.CONFIG_SHA }}" \
             --stock-crcs config/q2-device-crcs.json \
             --loader-command "$MODULE_DIR/.loader.o.cmd" \
             $AUDIT_FLAGS \
