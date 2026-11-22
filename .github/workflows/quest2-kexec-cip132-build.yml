@@ -463,10 +463,18 @@ jobs:
           if [[ "${{ env.EXPERIMENTAL }}" == "true" || "${{ env.MODULE_SOURCE }}" == "q2fork" ]]; then
             AUDIT_FLAGS="--allow-experimental-jump"
           fi
+          # kbuild regenerates $KERNEL_OUT/.config during the module build, so
+          # restore the audited config that passed the cmp guard before auditing.
+          cp "${{ github.workspace }}/config/prepared.config" "$KERNEL_OUT/.config"
+          ACTUAL_CONFIG_SHA=$(sha256sum "$KERNEL_OUT/.config" | cut -d' ' -f1)
+          if [[ "$ACTUAL_CONFIG_SHA" != "${{ steps.config.outputs.CONFIG_SHA }}" ]]; then
+            echo "::error::Restored config SHA mismatch: $ACTUAL_CONFIG_SHA != ${{ steps.config.outputs.CONFIG_SHA }}"
+            exit 1
+          fi
           python3 quest2_audit_cip132.py modules \
             --symvers "$KERNEL_OUT/Module.symvers" \
             --config "$KERNEL_OUT/.config" \
-            --config-sha "${{ env.CONFIG_SHA }}" \
+            --config-sha "${{ steps.config.outputs.CONFIG_SHA }}" \
             --stock-crcs config/q2-device-crcs.json \
             --loader-command "$MODULE_DIR/.loader.o.cmd" \
             $AUDIT_FLAGS \
