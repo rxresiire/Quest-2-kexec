@@ -116,17 +116,19 @@ struct qkx_stop_data {
 	u64 pgd;
 	u64 entry;
 	u64 fdt;
+	u64 stack;
 };
 
 static void *pgd_page;
-static void __noreturn qkx_kexec_handoff(u64 pgd, u64 entry, u64 fdt);
+static void *jump_stack;
+static void __noreturn qkx_kexec_handoff(u64 pgd, u64 entry, u64 fdt, u64 stack);
 
 static int qkx_stop_cpu(void *data)
 {
 	struct qkx_stop_data *sd = data;
 
 	if (smp_processor_id() == 0) {
-		qkx_kexec_handoff(sd->pgd, sd->entry, sd->fdt);
+		qkx_kexec_handoff(sd->pgd, sd->entry, sd->fdt, sd->stack);
 		/* Never returns */
 	}
 	for (;;)
@@ -134,15 +136,19 @@ static int qkx_stop_cpu(void *data)
 	return 0;
 }
 
-static void __noreturn qkx_kexec_handoff(u64 pgd, u64 entry, u64 fdt)
+static void __noreturn qkx_kexec_handoff(u64 pgd, u64 entry, u64 fdt, u64 stack)
 {
 	unsigned int i;
 
-	/* Cache coherency: flush every staged page to PoC. */
-	for (i = 0; i < nr_owned; i++)
-		__flush_dcache_area(page_address(owned[i]), PAGE_SIZE);
-	__flush_icache_range((unsigned long)pgd_page,
-			     (unsigned long)pgd_page + PAGE_SIZE);
+	/* Cache coherency: clean and invalidate every staged page to PoC/PoU. */
+	for (i = 0; i < nr_owned; i++) {
+		void *va = page_address(owned[i]);
+		__flush_dcache_area(va, PAGE_SIZE);
+		__invalidate_dcache_area(va, PAGE_SIZE);
+	}
+	__flush_dcache_area(page_address(jump_stack), PAGE_SIZE);
+	__invalidate_dcache_area(page_address(jump_stack), PAGE_SIZE);
+	__flush_icache_all();
 	dsb(ish);
 	isb();
 
@@ -176,6 +182,12 @@ static void __noreturn qkx_kexec_handoff(u64 pgd, u64 entry, u64 fdt)
 		"msr tcr_el1, x9\n"
 		"isb\n"
 		: : : "x9", "x10", "memory"
+	);
+
+	/* Switch to dedicated jump stack before entering new kernel. */
+	asm volatile (
+		"mov sp, %0\n"
+		: : "r" (stack) : "sp"
 	);
 
 	/* Branch to new kernel entry: x0=DTB, x1-x3=0. */
@@ -406,9 +418,10 @@ static int qkx_identity_map(void)
 		return -E2BIG;
 	code_page = qkx_page();
 	pgd_page = qkx_page();
+	jump_stack = qkx_page();
 	pud = qkx_page();
 	qkx_pud = qkx_page();
-	if (!code_page || !pgd_page || !pud || !qkx_pud)
+	if (!code_page || !pgd_page || !jump_stack || !pud || !qkx_pud)
 		return -ENOMEM;
 	pgd = pgd_page;
 	pa = virt_to_phys(code_page);
@@ -424,6 +437,10 @@ static int qkx_identity_map(void)
 		qkx_pud[(addr >> 21) & 511] = addr | PMD_TYPE_SECT |
 			PMD_SECT_AF | PMD_SECT_S | PMD_ATTRINDX(MT_NORMAL);
 	}
+	/* Map the dedicated jump stack at QKX_HI so SP is valid after
+	 * TTBR0 switch. Stack grows down from QKX_HI + PAGE_SIZE. */
+	qkx_pud[(QKX_HI >> 21) & 511] = virt_to_phys(jump_stack) | PMD_TYPE_SECT |
+		PMD_SECT_AF | PMD_SECT_S | PMD_ATTRINDX(MT_NORMAL);
 	memcpy(code_page, qkx_reloc_start, len);
 	return 0;
 }
@@ -1039,6 +1056,7 @@ enter_now:
 			.pgd = virt_to_phys(pgd_page),
 			.entry = qkx_entry,
 			.fdt = QKX_DTB,
+			.stack = QKX_HI + PAGE_SIZE,
 		};
 		ret = stop_machine_fn(qkx_stop_cpu, &sd, (unsigned int)-1);
 		/* Never returns on success */
