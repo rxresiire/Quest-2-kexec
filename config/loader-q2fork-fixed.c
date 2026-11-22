@@ -140,14 +140,12 @@ static void __noreturn qkx_kexec_handoff(u64 pgd, u64 entry, u64 fdt, u64 stack)
 {
 	unsigned int i;
 
-	/* Cache coherency: clean and invalidate every staged page to PoC/PoU. */
+	/* Cache coherency: clean every staged page to PoC. */
 	for (i = 0; i < nr_owned; i++) {
 		void *va = page_address(owned[i]);
 		__flush_dcache_area(va, PAGE_SIZE);
-		__inval_dcache_area(va, PAGE_SIZE);
 	}
 	__flush_dcache_area(page_address(jump_stack), PAGE_SIZE);
-	__inval_dcache_area(page_address(jump_stack), PAGE_SIZE);
 	__flush_icache_all();
 	dsb(ish);
 	isb();
