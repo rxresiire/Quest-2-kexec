@@ -239,10 +239,11 @@ jobs:
             cd "$KERNEL_SRC"
             make O="$KERNEL_OUT" "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig
             # CONFIG_PHYSICAL_START must be set AFTER olddefconfig because
-            # olddefconfig resets it to the arch default. The stock Image is
-            # linked for QCOM default 0x14688000 but our module stages it at
-            # QKX_ENTRY=0x90080000, causing an immediate panic on jump.
-            "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x90080000
+            # olddefconfig resets it to the arch default. CONFIG_PHYSICAL_START
+            # must match the kernel's link address (0x14688000) so CONFIG_RELOCATABLE
+            # can copy the kernel from code0 (0x90080000) to its link address
+            # during early boot, fixing all absolute address references.
+            "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x14688000
             cp "$KERNEL_OUT/.config" "$PREPARED"
           elif [[ -f "${{ github.workspace }}/clean_repo/config/q2-stock.config" ]]; then
             # The headset's own /proc/config.gz (firmware 52322490022300150) is the
@@ -259,10 +260,11 @@ jobs:
             cd "$KERNEL_SRC"
             make O="$KERNEL_OUT" "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig
             # CONFIG_PHYSICAL_START must be set AFTER olddefconfig because
-            # olddefconfig resets it to the arch default. The stock Image is
-            # linked for QCOM default 0x14688000 but our module stages it at
-            # QKX_ENTRY=0x90080000, causing an immediate panic on jump.
-            "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x90080000
+            # olddefconfig resets it to the arch default. CONFIG_PHYSICAL_START
+            # must match the kernel's link address (0x14688000) so CONFIG_RELOCATABLE
+            # can copy the kernel from code0 (0x90080000) to its link address
+            # during early boot, fixing all absolute address references.
+            "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x14688000
             cp "$KERNEL_OUT/.config" "$PREPARED"
             SOURCE=device-config
             cd "${{ github.workspace }}/clean_repo"
@@ -277,7 +279,7 @@ jobs:
             make O="$KERNEL_OUT" "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig
             # CONFIG_PHYSICAL_START must be set AFTER olddefconfig because
             # olddefconfig resets it to the arch default.
-            "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x90080000
+            "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x14688000
             cp "$KERNEL_OUT/.config" "$PREPARED"
             SOURCE=source-defconfig
             cd "${{ github.workspace }}/clean_repo"
@@ -293,7 +295,7 @@ jobs:
           cp "$PREPARED" "$KERNEL_OUT/.config"
           make O="$KERNEL_OUT" "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig > /dev/null
           # CONFIG_PHYSICAL_START is reset by olddefconfig; re-apply for comparison
-          "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x90080000
+          "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x14688000
           if ! cmp -s "$PREPARED" "$KERNEL_OUT/.config"; then
             echo "::error::olddefconfig is not idempotent under the build toolchain."
             diff -u "$PREPARED" "$KERNEL_OUT/.config" | tee "${{ runner.temp }}/config-diff.patch" || true
@@ -345,7 +347,7 @@ jobs:
           make O="$KERNEL_OUT" "${build_flags[@]}" olddefconfig
           # CONFIG_PHYSICAL_START is reset by olddefconfig; re-apply after so
           # the config matches what was audited in the config step.
-          "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x90080000
+          "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x14688000
 
           if ! cmp -s "${{ github.workspace }}/config/prepared.config" "$KERNEL_OUT/.config"; then
             echo "::error::olddefconfig rewrote the audited config; the configuration does not match the build toolchain."
