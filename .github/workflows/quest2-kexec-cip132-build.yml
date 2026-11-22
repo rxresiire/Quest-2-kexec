@@ -258,8 +258,10 @@ jobs:
             # so no CRC moves.
             "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --disable LOCALVERSION_AUTO
             "$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" --set-val CONFIG_PHYSICAL_START 0x90080000
+            echo "CONFIG_PHYSICAL_START after set-val: $(grep '^CONFIG_PHYSICAL_START=' "$KERNEL_OUT/.config" || echo 'NOT FOUND')"
             cd "$KERNEL_SRC"
             make O="$KERNEL_OUT" "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig
+            echo "CONFIG_PHYSICAL_START after olddefconfig: $(grep '^CONFIG_PHYSICAL_START=' "$KERNEL_OUT/.config" || echo 'NOT FOUND')"
             cp "$KERNEL_OUT/.config" "$PREPARED"
             SOURCE=device-config
             cd "${{ github.workspace }}/clean_repo"
