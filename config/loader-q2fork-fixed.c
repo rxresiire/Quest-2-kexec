@@ -316,8 +316,9 @@ static int qkx_ram_cb(struct resource *res, void *arg)
 
 static int qkx_identity_map(void)
 {
-	u64 *pgd, *pud;
+	u64 *pgd, *pud, *qkx_pud;
 	phys_addr_t pa;
+	u64 addr;
 	size_t len = qkx_reloc_end - qkx_reloc_start;
 	BUILD_BUG_ON(PAGE_SIZE != 4096);
 	BUILD_BUG_ON(CONFIG_ARM64_VA_BITS != 39);
@@ -326,7 +327,8 @@ static int qkx_identity_map(void)
 	code_page = qkx_page();
 	pgd_page = qkx_page();
 	pud = qkx_page();
-	if (!code_page || !pgd_page || !pud)
+	qkx_pud = qkx_page();
+	if (!code_page || !pgd_page || !pud || !qkx_pud)
 		return -ENOMEM;
 	pgd = pgd_page;
 	pa = virt_to_phys(code_page);
@@ -334,6 +336,14 @@ static int qkx_identity_map(void)
 	pgd[(pa >> 30) & 511] = virt_to_phys(pud) | PUD_TYPE_TABLE;
 	pud[(pa >> 21) & 511] = (pa & PMD_MASK) | PMD_TYPE_SECT |
 		PMD_SECT_AF | PMD_SECT_S | PMD_ATTRINDX(MT_NORMAL);
+	/* Identity-map the QKX destination window so the new kernel can fetch
+	 * instructions and data after TTBR0 switch. Uses a separate PUD page
+	 * to avoid PGD-entry collisions with code_page's address. */
+	pgd[(QKX_LO >> 30) & 511] = virt_to_phys(qkx_pud) | PUD_TYPE_TABLE;
+	for (addr = QKX_LO; addr < QKX_HI; addr += SZ_2M) {
+		qkx_pud[(addr >> 21) & 511] = addr | PMD_TYPE_SECT |
+			PMD_SECT_AF | PMD_SECT_S | PMD_ATTRINDX(MT_NORMAL);
+	}
 	memcpy(code_page, qkx_reloc_start, len);
 	return 0;
 }
