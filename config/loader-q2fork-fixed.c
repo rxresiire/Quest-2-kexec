@@ -118,6 +118,7 @@ struct qkx_stop_data {
 	u64 fdt;
 };
 
+static void *pgd_page;
 static void __noreturn qkx_kexec_handoff(u64 pgd, u64 entry, u64 fdt);
 
 static int qkx_stop_cpu(void *data)
@@ -179,11 +180,11 @@ static void __noreturn qkx_kexec_handoff(u64 pgd, u64 entry, u64 fdt)
 
 	/* Branch to new kernel entry: x0=DTB, x1-x3=0. */
 	asm volatile (
-		"mov x0, %1\n"
+		"mov x0, %0\n"
 		"mov x1, xzr\n"
 		"mov x2, xzr\n"
 		"mov x3, xzr\n"
-		"br %2\n"
+		"br %1\n"
 		: : "r" (fdt), "r" (entry) : "x0", "x1", "x2", "x3", "memory"
 	);
 
