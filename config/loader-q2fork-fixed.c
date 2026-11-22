@@ -144,10 +144,10 @@ static void __noreturn qkx_kexec_handoff(u64 pgd, u64 entry, u64 fdt, u64 stack)
 	for (i = 0; i < nr_owned; i++) {
 		void *va = page_address(owned[i]);
 		__flush_dcache_area(va, PAGE_SIZE);
-		__invalidate_dcache_area(va, PAGE_SIZE);
+		__inval_dcache_area(va, PAGE_SIZE);
 	}
 	__flush_dcache_area(page_address(jump_stack), PAGE_SIZE);
-	__invalidate_dcache_area(page_address(jump_stack), PAGE_SIZE);
+	__inval_dcache_area(page_address(jump_stack), PAGE_SIZE);
 	__flush_icache_all();
 	dsb(ish);
 	isb();
