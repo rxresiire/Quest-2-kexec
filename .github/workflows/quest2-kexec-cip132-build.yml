@@ -400,6 +400,7 @@ jobs:
           fi
 
           read -r -a kflags <<< "$KBUILD_FLAGS"
+          make -C "${{ github.workspace }}/modulesrc/module" clean 2>/dev/null || true
           make -C "$KERNEL_OUT" -j"$(nproc)" \
             "${kflags[@]}" LOCALVERSION="$KERNEL_LOCALVERSION" \
             KBUILD_BUILD_USER=questbuilder KBUILD_BUILD_HOST=quest2-ci \
