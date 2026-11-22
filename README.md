@@ -24,7 +24,7 @@ attempt.
 | `CONFIG_RELOCATABLE=y` | Stock kernel has it | Kernel can self-relocate from code0 to link address at boot |
 | CI pipeline | Works | Builds kernel image + module via GitHub Actions, audits config/module CRCs, builds installer APK |
 | Installer APK | Built | `app/installer/build/outputs/apk/debug/installer-debug.apk`, connects via ADB TCP, installs as Magisk module |
-| Device root | Works | Magisk auto-roots ~15s after reboot; `/product/bin/su` returns `uid=0` |
+| Device root | Works | Magisk auto-roots ~15s after reboot via **Singularity** (thanks **Lumi**!); `/product/bin/su` returns `uid=0` |
 | Startup script | Installed | `/data/adb/service.d/qkx-boot.sh` — Magisk service.d, auto-runs on boot |
 | Payload persistence | On device | `/data/local/tmp/qkx-{Image,quest_kexec_q2.ko,initramfs,boot.dtb}` |
 
@@ -142,6 +142,15 @@ the kernel can copy itself from code0 (`0x90080000`) to its link address
    `CONFIG_KEXEC=y` which CI audit currently blocks.
 3. **KASLR leak** — `kptr_restrict=2` hides kernel pointers from root; `kprobe`
    resolves symbols but no arbitrary memory read is available.
+
+---
+
+## Credits
+
+- **Lumi** — Magisk auto-root via **Singularity** on Quest 2 (`hollywood`); made the entire project testable on a retail headset without manual root steps.
+- **machachu56** — `quest-kexec-q2` q2fork port (loader + transition assembly).
+- **WitherBlitz** — upstream kexec module sources (`uploader.c`, `transition.S`).
+- Meta / Qualcomm — Quest 2 kernel source (`oculus-linux-kernel`).
 
 ---
 
