@@ -24,6 +24,7 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <asm/cacheflush.h>
+#include <asm/barrier.h>
 #include <asm/memory.h>
 #include <asm/pgtable.h>
 #include <asm/sysreg.h>
@@ -101,15 +102,93 @@ MODULE_PARM_DESC(watchdog_recovery, "Keep apps WDT armed for an automatic diagno
 MODULE_PARM_DESC(watchdog_control, "After shutdown, latch a 10-second watchdog and spin for host timing calibration");
 MODULE_PARM_DESC(execute, "Experimental irreversible jump after staging (default false)");
 
-extern void qkx_enter(u64 pgd, u64 code, u64 descriptors, u64 entry, u64 fdt) __noreturn;
 extern const char qkx_reloc_start[], qkx_reloc_end[];
 extern const char qkx_probe_phys_start[], qkx_probe_phys_end[];
 extern const char qkx_reloc_return_start[], qkx_reloc_return_end[];
 extern unsigned long qkx_roundtrip(u64 pgd, u64 code, u64 descriptors,
 				   u64 return_entry, u64 cookie);
 static unsigned long (*lookup)(const char *);
+static int (*stop_machine_fn)(int (*fn)(void *), void *cpudata, unsigned int cpu);
 static struct page **owned;
 static unsigned int nr_owned, nr_copies;
+
+struct qkx_stop_data {
+	u64 pgd;
+	u64 entry;
+	u64 fdt;
+};
+
+static void __noreturn qkx_kexec_handoff(u64 pgd, u64 entry, u64 fdt);
+
+static int qkx_stop_cpu(void *data)
+{
+	struct qkx_stop_data *sd = data;
+
+	if (smp_processor_id() == 0) {
+		qkx_kexec_handoff(sd->pgd, sd->entry, sd->fdt);
+		/* Never returns */
+	}
+	for (;;)
+		cpu_relax();
+	return 0;
+}
+
+static void __noreturn qkx_kexec_handoff(u64 pgd, u64 entry, u64 fdt)
+{
+	unsigned int i;
+
+	/* Cache coherency: flush every staged page to PoC. */
+	for (i = 0; i < nr_owned; i++)
+		__flush_dcache_area(page_address(owned[i]), PAGE_SIZE);
+	__flush_icache_range((unsigned long)pgd_page,
+			     (unsigned long)pgd_page + PAGE_SIZE);
+	dsb(ish);
+	isb();
+
+	local_irq_disable();
+	preempt_disable();
+
+	/* Invalidate old TTBR0 translations with walks disabled. */
+	asm volatile (
+		"mrs x9, tcr_el1\n"
+		"orr x9, x9, #(1 << 7)\n"
+		"msr tcr_el1, x9\n"
+		"isb\n"
+		"dsb ishst\n"
+		"tlbi vmalle1\n"
+		"dsb ish\n"
+		"isb\n"
+		"msr ttbr0_el1, %0\n"
+		"isb\n"
+		: : "r" (pgd) : "x9", "memory"
+	);
+
+	/* TCR: T0SZ=25 (39-bit VA), TG0=4K, preserve shareability/cacheability. */
+	asm volatile (
+		"mrs x9, tcr_el1\n"
+		"bic x9, x9, #0x3f\n"
+		"mov x10, #25\n"
+		"orr x9, x9, x10\n"
+		"bic x9, x9, #(3 << 14)\n"
+		"bic x9, x9, #(1 << 37)\n"
+		"bic x9, x9, #(1 << 7)\n"
+		"msr tcr_el1, x9\n"
+		"isb\n"
+		: : : "x9", "x10", "memory"
+	);
+
+	/* Branch to new kernel entry: x0=DTB, x1-x3=0. */
+	asm volatile (
+		"mov x0, %1\n"
+		"mov x1, xzr\n"
+		"mov x2, xzr\n"
+		"mov x3, xzr\n"
+		"br %2\n"
+		: : "r" (fdt), "r" (entry) : "x0", "x1", "x2", "x3", "memory"
+	);
+
+	for (;;);
+}
 
 #define QKX_QMP_LINK_DOWN 0xFFFF0000
 #define QKX_QMP_CH_DISCONNECTED 0xFFFF0000
@@ -641,6 +720,7 @@ static int __maybe_unused qkx_execute(void)
 	void (*hotplug_enable)(void) = (void *)lookup("cpu_hotplug_enable");
 	void (*shutdown_cpus)(void) = (void *)lookup("machine_shutdown");
 	bool *kexec_progress = (void *)lookup("kexec_in_progress");
+	stop_machine_fn = (void *)lookup("stop_machine");
 	bool (*stuck)(void) = (void *)lookup("cpus_are_stuck_in_kernel");
 	const u32 *mode = (void *)lookup("__boot_cpu_mode");
 	int (*freeze_users)(void) = (void *)lookup("freeze_processes");
@@ -670,7 +750,7 @@ static int __maybe_unused qkx_execute(void)
 	int ret;
 	qkx_phase(1, "symbol lookups returned", true);
 	if (!prepare || !migrate || !hotplug_enable || !shutdown_cpus ||
-	    !stuck || !mode)
+	    !stuck || !mode || !stop_machine_fn)
 		return -ENOENT;
 	pr_emerg("quest_kexec: native shutdown symbols ready; kexec_in_progress=%s\n",
 		 kexec_progress ? "available" : "compiled out");
@@ -952,8 +1032,16 @@ enter_now:
 			filp_close(mf, NULL);
 		}
 	}
-	qkx_enter(virt_to_phys(pgd_page), virt_to_phys(code_page),
-		virt_to_phys(first_desc), qkx_entry, QKX_DTB);
+	/* stop_machine() parks secondary CPUs; CPU0 does the MMU-on handoff. */
+	{
+		struct qkx_stop_data sd = {
+			.pgd = virt_to_phys(pgd_page),
+			.entry = qkx_entry,
+			.fdt = QKX_DTB,
+		};
+		ret = stop_machine_fn(qkx_stop_cpu, &sd, (unsigned int)-1);
+		/* Never returns on success */
+	}
 release_devices:
 	if (syncboss_suspended && syncboss && syncboss->driver &&
 	    syncboss->driver->pm && syncboss->driver->pm->resume)
