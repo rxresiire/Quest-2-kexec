@@ -410,6 +410,8 @@ static int qkx_identity_map(void)
 	phys_addr_t pa;
 	u64 addr;
 	size_t len = qkx_reloc_end - qkx_reloc_start;
+	phys_addr_t ktext_pa = __pa(_text);
+	phys_addr_t kend_pa = __pa(_end);
 	BUILD_BUG_ON(PAGE_SIZE != 4096);
 	BUILD_BUG_ON(CONFIG_ARM64_VA_BITS != 39);
 	if (len > PAGE_SIZE)
@@ -439,6 +441,21 @@ static int qkx_identity_map(void)
 	 * TTBR0 switch. Stack grows down from QKX_HI + PAGE_SIZE. */
 	qkx_pud[(QKX_HI >> 21) & 511] = virt_to_phys(jump_stack) | PMD_TYPE_SECT |
 		PMD_SECT_AF | PMD_SECT_S | PMD_ATTRINDX(MT_NORMAL);
+	/* Identity-map the running kernel's static memory (text/data/bss) so the
+	 * new kernel can access its static page table structures (swapper_pg_dir,
+	 * etc.) during early boot before setting up its own page tables. */
+	for (addr = ktext_pa & PMD_MASK; addr < (kend_pa + PMD_SIZE - 1) & PMD_MASK; addr += SZ_2M) {
+		unsigned int pgd_idx = (addr >> 30) & 511;
+		if (!pgd[pgd_idx]) {
+			void *new_pud = qkx_page();
+			if (!new_pud)
+				return -ENOMEM;
+			pgd[pgd_idx] = virt_to_phys(new_pud) | PUD_TYPE_TABLE;
+		}
+		u64 *pud_page = (u64 *)phys_to_virt(pgd[pgd_idx] & PMD_MASK);
+		pud_page[(addr >> 21) & 511] = addr | PMD_TYPE_SECT |
+			PMD_SECT_AF | PMD_SECT_S | PMD_ATTRINDX(MT_NORMAL);
+	}
 	memcpy(code_page, qkx_reloc_start, len);
 	return 0;
 }
